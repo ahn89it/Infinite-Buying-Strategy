@@ -1,0 +1,171 @@
+"""
+db.py
+=====
+SQLite 커넥션 생성과 스키마(테이블) 초기화를 담당하는 공용 모듈입니다.
+
+왜 이 모듈이 필요한가?
+- state.py, trade_history.py 등 여러 모듈이 같은 SQLite 파일을 공유합니다.
+  "커넥션을 어떻게 열지", "테이블이 없으면 어떻게 만들지"를 각 모듈이 따로
+  구현하면 스키마가 흩어지고 중복됩니다. 이 모듈 하나에만 CREATE TABLE 문을
+  모아두고, 다른 모듈은 이 모듈이 제공하는 커넥션만 받아서 씁니다.
+- 금액/T값 같은 정밀도가 중요한 값은 SQLite에 REAL(float)로 저장하지 않고
+  TEXT로 저장합니다. SQLite의 REAL은 IEEE754 float이라 Decimal의 정밀도를
+  보장하지 못하기 때문입니다(설계도 2번 "Decimal 타입 사용 권장"과 동일한 이유).
+  각 모듈은 저장 시 str(Decimal 값), 로드 시 Decimal(문자열)로 변환해서 씁니다.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
+
+# 스키마 정의: 설계도 1번(state), 9-2번(buy/sell_records, cycle_summary),
+# 9-4번(portfolio_summary)을 그대로 SQL 테이블로 옮긴 것입니다.
+#
+# "IF NOT EXISTS"를 써서 이미 테이블이 있는 재시작 상황에서도 안전하게
+# 반복 실행할 수 있게 합니다(설계도 1번 "재시작에도 상태가 유지되어야 함").
+_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    # state: 현재 진행 중인 사이클의 상태를 담는 "싱글턴" 테이블입니다.
+    # 항상 id=1인 행 하나만 존재하도록 CHECK 제약을 걸어, 실수로 여러 상태가
+    # 동시에 생기는 것을 DB 레벨에서 막습니다.
+    """
+    CREATE TABLE IF NOT EXISTS state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        mode TEXT NOT NULL,                    -- "NORMAL" | "REVERSE"
+        phase TEXT,                             -- "FIRST" | "FIRST_HALF" | "SECOND_HALF" (NORMAL일 때만)
+        split_count INTEGER NOT NULL,           -- 20 | 40
+        principal TEXT NOT NULL,                -- Decimal 문자열, 현재 사이클 원금
+        remaining_cash TEXT NOT NULL,           -- Decimal 문자열, 잔금
+        t_value TEXT NOT NULL,                  -- Decimal 문자열, 회차값 T (SQL 예약어 회피를 위해 t_value로 명명)
+        avg_price TEXT NOT NULL,                -- Decimal 문자열, 평단가
+        holding_qty INTEGER NOT NULL,           -- 보유 수량
+        cycle_id INTEGER NOT NULL,              -- 현재 사이클 번호
+        cycle_start_date TEXT NOT NULL,         -- YYYY-MM-DD
+        reverse_day_count INTEGER NOT NULL DEFAULT 0,  -- 리버스모드 경과일 (D1, D2, ...)
+        reverse_prev_qty INTEGER NOT NULL DEFAULT 0,   -- 리버스모드 전일 보유수량
+        updated_at TEXT NOT NULL                -- ISO8601 타임스탬프, 마지막 갱신 시각
+    )
+    """,
+    # buy_records: 사람이 조회하는 매수 체결 이력 (설계도 9-2번)
+    """
+    CREATE TABLE IF NOT EXISTS buy_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cycle_id INTEGER NOT NULL,
+        buy_date TEXT NOT NULL,                 -- YYYY-MM-DD, 체결일
+        buy_price TEXT NOT NULL,                -- Decimal 문자열, 체결 단가
+        buy_qty INTEGER NOT NULL,               -- 체결 수량
+        buy_amount TEXT NOT NULL,               -- Decimal 문자열, buy_price * buy_qty
+        order_type TEXT NOT NULL,               -- FIRST | HALF_STAR | HALF_AVG | FULL_STAR | REVERSE 등
+        t_after TEXT NOT NULL,                  -- 이 매수 체결 직후 T값 스냅샷
+        avg_price_after TEXT NOT NULL,          -- 이 매수 체결 직후 평단가 스냅샷
+        created_at TEXT NOT NULL                -- 레코드 기록 시각(ISO8601)
+    )
+    """,
+    # sell_records: 사람이 조회하는 매도 체결 이력 (설계도 9-2번)
+    """
+    CREATE TABLE IF NOT EXISTS sell_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cycle_id INTEGER NOT NULL,
+        sell_date TEXT NOT NULL,
+        sell_price TEXT NOT NULL,
+        sell_qty INTEGER NOT NULL,
+        sell_amount TEXT NOT NULL,
+        order_type TEXT NOT NULL,               -- QUARTER | LIMIT_15PCT | REVERSE_MOC | REVERSE_LOC
+        avg_price_at_sell TEXT NOT NULL,
+        return_pct TEXT NOT NULL,               -- (sell_price - avg_price_at_sell) / avg_price_at_sell * 100
+        profit_amount TEXT NOT NULL,             -- (sell_price - avg_price_at_sell) * sell_qty
+        t_after TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    # cycle_summary: 사이클 종료(보유수량 0) 시점에 자동 생성되는 요약 (설계도 9-2번)
+    """
+    CREATE TABLE IF NOT EXISTS cycle_summary (
+        cycle_id INTEGER PRIMARY KEY,
+        start_date TEXT NOT NULL,
+        end_date TEXT,                          -- 사이클이 끝나기 전에는 NULL
+        total_buy_amount TEXT NOT NULL DEFAULT '0',
+        total_sell_amount TEXT NOT NULL DEFAULT '0',
+        cycle_profit_amount TEXT,               -- total_sell_amount - total_buy_amount
+        cycle_return_pct TEXT,
+        hit_reverse_mode INTEGER NOT NULL DEFAULT 0,  -- SQLite에는 BOOLEAN이 없어 0/1로 저장
+        duration_days INTEGER
+    )
+    """,
+    # portfolio_summary: 사이클을 넘어선 계좌 전체 누적 성과, 단일 행(id=1) (설계도 9-4번)
+    """
+    CREATE TABLE IF NOT EXISTS portfolio_summary (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        strategy_start_date TEXT NOT NULL,
+        initial_principal TEXT NOT NULL,
+        total_realized_profit TEXT NOT NULL DEFAULT '0',
+        total_realized_return_pct TEXT NOT NULL DEFAULT '0',
+        current_unrealized_pnl TEXT NOT NULL DEFAULT '0',
+        current_unrealized_return_pct TEXT NOT NULL DEFAULT '0',
+        total_equity TEXT NOT NULL,
+        total_return_pct TEXT NOT NULL DEFAULT '0',
+        completed_cycles INTEGER NOT NULL DEFAULT 0,
+        last_updated TEXT NOT NULL
+    )
+    """,
+    # submitted_orders: scheduler.py가 오늘 제출한 주문을 기록해두는 내부 장부 테이블입니다.
+    # 설계도 9번 스키마에는 없지만(설계도는 "체결 확인된" 기록만 다룸), 다음 실행 때 체결
+    # 내역(order_no)과 "이 주문이 무슨 목적(purpose)의 주문이었는지"를 대조하려면 필요한
+    # 최소한의 운영용 부가 테이블입니다. 체결 확인 후에는 buy_records/sell_records로
+    # 정식 기록되고, 이 테이블의 해당 행은 더 이상 필요 없어져 정리(purge)됩니다.
+    """
+    CREATE TABLE IF NOT EXISTS submitted_orders (
+        order_no TEXT PRIMARY KEY,
+        submitted_date TEXT NOT NULL,
+        side TEXT NOT NULL,
+        order_kind TEXT NOT NULL,
+        price TEXT,
+        qty INTEGER NOT NULL,
+        purpose TEXT NOT NULL,
+        is_decoy INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    # 조회 성능을 위한 인덱스. cycle_id로 거래 이력을 자주 조회하므로(대시보드 등) 추가합니다.
+    "CREATE INDEX IF NOT EXISTS idx_buy_records_cycle_id ON buy_records (cycle_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sell_records_cycle_id ON sell_records (cycle_id)",
+)
+
+
+def get_connection(db_path: Path) -> sqlite3.Connection:
+    """SQLite 커넥션을 열고 스키마를 초기화한 뒤 반환합니다.
+
+    - db_path의 부모 디렉터리가 없으면 만들어줍니다(Docker 볼륨 최초 마운트 시
+      데이터 디렉터리가 비어있는 경우 대비).
+    - row_factory를 sqlite3.Row로 설정해, 다른 모듈에서 `row["column_name"]`처럼
+      컬럼명으로 접근할 수 있게 합니다(인덱스 번호로 접근하면 컬럼 순서가 바뀔 때
+      버그가 생기기 쉬움).
+    - foreign_keys는 이 스키마에서 FK를 쓰지 않으므로 별도로 켜지 않습니다.
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path, isolation_level=None)  # autocommit 모드: 각 실행이 즉시 커밋됨
+    conn.row_factory = sqlite3.Row
+    init_db(conn)
+    return conn
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    """스키마를 생성합니다(이미 존재하면 아무 것도 하지 않음). 여러 번 호출해도 안전합니다."""
+    for statement in _SCHEMA_STATEMENTS:
+        conn.execute(statement)
+
+
+@contextmanager
+def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
+    """`with connect(db_path) as conn:` 형태로 쓰는 컨텍스트 매니저.
+
+    짧은 스크립트(테스트, 일회성 조회 등)에서 커넥션을 열고 확실히 닫기 위해 사용합니다.
+    scheduler.py처럼 프로세스 내내 살아있는 장기 실행 컨텍스트에서는 get_connection()을
+    직접 써서 커넥션을 계속 재사용하는 것을 권장합니다.
+    """
+    conn = get_connection(db_path)
+    try:
+        yield conn
+    finally:
+        conn.close()

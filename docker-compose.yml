@@ -1,0 +1,10 @@
+services:
+  infinite_buying:
+    build: .
+    container_name: infinite_buying_v4
+    env_file:
+      - .env
+    volumes:
+      # SQLite DB, 이벤트 로그(JSONL)를 컨테이너 재시작/재빌드에도 유지하기 위한 볼륨.
+      - ./data:/app/data
+    restart: unless-stopped

@@ -1,0 +1,12 @@
+# 런타임(운영) 의존성입니다. Docker 이미지에도 이 파일만 설치됩니다.
+
+# 키움증권 공식 REST API 파이썬 클라이언트 (OAuth 토큰 발급/갱신, REST 호출, WebSocket
+# 실시간 구독을 제공합니다). github.com/Kiwoom-Securities/Kiwoom-REST-API 참고.
+kwcli>=1.0.0
+
+# .env 파일의 환경변수를 로드하기 위해 사용합니다 (config.py 참고).
+python-dotenv>=1.0.0
+
+# 매일 프리장/본장 시작 시각에 맞춰 자동 실행을 예약하기 위해 사용합니다 (scheduler.py).
+# America/New_York 타임존 cron 트리거를 지원해 서머타임 전환을 자동으로 반영합니다.
+APScheduler>=3.10.0

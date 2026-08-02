@@ -1,0 +1,4 @@
+# 개발/테스트 전용 의존성입니다. Docker 이미지에는 포함되지 않습니다.
+-r requirements.txt
+
+pytest>=8.0.0
