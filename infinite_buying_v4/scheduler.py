@@ -25,6 +25,16 @@ normal_mode.py, reverse_mode.py, market_hours.py, kiwoom_adapter.py, notifier.py
   가장 해석의 여지가 있는 "지정가매도 후 같은 날 LOC매수 체결" 조합 케이스를 다룹니다.
   이 조합이 실제로 발생했을 때는 WARNING 알림을 보내 사람이 한 번 더 확인하도록
   했습니다 — 자동으로 조용히 넘어가지 않습니다.
+
+멱등성/드라이런/예외 정책 (자세한 내용은 운영 런북 문서 참고):
+- 멱등성: run_premarket_update()/run_regular_session_orders()는 각각 실행 맨 앞에서
+  _claim_daily_run()으로 (run_type, 오늘날짜)를 선점합니다. 이미 선점되어 있으면(=오늘
+  이미 실행됨, 컨테이너 재시작 등) 아무 side-effect 없이 즉시 반환합니다.
+- 드라이런: config.dry_run=True면 모든 주문 제출이 _submit_or_dry_run()을 통해 실제
+  API 호출 없이 로그로만 남습니다. KIWOOM_MODE(real/demo)와는 독립된 별개의 플래그입니다.
+- 예외 정책: 이 모듈의 함수가 처리하지 않고 밖으로 던지는 예외(_run_guarded가 감쌈)는
+  전부 "자동매매 중단" 대상입니다. CRITICAL 알림을 보낸 뒤 스케줄러 자체를 종료시킵니다
+  (다음날 조용히 재시도하지 않음).
 """
 
 from __future__ import annotations
@@ -32,7 +42,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from infinite_buying_v4 import db, event_log, normal_mode, reverse_mode, trade_history
@@ -115,6 +125,89 @@ def _purge_submitted_order(conn: sqlite3.Connection, order_no: str) -> None:
     conn.execute("DELETE FROM submitted_orders WHERE order_no = ?", (order_no,))
 
 
+def _purge_stale_submitted_orders(conn: sqlite3.Connection, *, before_date: date) -> int:
+    """before_date보다 이전에 제출됐지만 체결 매칭이 안 된(=취소된) 주문 기록을 정리합니다.
+
+    반드시 _classify_daily_events()로 그날의 체결 매칭을 **끝낸 뒤에만** 호출해야 합니다
+    (먼저 지우면 매칭할 대상 자체가 사라져 버립니다). 정리하지 않고 방치하면 다음 실행의
+    부분체결 비율 계산(buy_intended)에 예전 주문이 계속 끼어들어 결과가 왜곡됩니다.
+    """
+    cursor = conn.execute("DELETE FROM submitted_orders WHERE submitted_date < ?", (before_date.isoformat(),))
+    return cursor.rowcount
+
+
+# ---------------------------------------------------------------------------
+# 멱등성(중복 실행 방지) 가드 — daily_run_log 테이블
+# ---------------------------------------------------------------------------
+
+
+def _claim_daily_run(conn: sqlite3.Connection, run_type: str, run_date: date) -> bool:
+    """(run_type, run_date) 조합을 오늘의 실행으로 선점합니다.
+
+    판정 키: **(run_type, run_date)** — run_type은 "PREMARKET" 또는 "REGULAR",
+    run_date는 America/New_York 기준 오늘 날짜(YYYY-MM-DD)입니다.
+    daily_run_log 테이블의 PRIMARY KEY 제약을 이용해 "먼저 선점한 하나만 통과"를
+    SQLite 레벨에서 원자적으로 보장합니다(파이썬 코드의 if문으로 체크하는 것보다
+    안전 — 프로세스가 거의 동시에 두 번 뜨는 경쟁 상황에도 DB가 막아줍니다).
+
+    반환값: 선점에 성공(=오늘 이 작업을 처음 시작함)하면 True, 이미 선점되어
+    있으면(=오늘 이미 실행됨, 컨테이너 재시작 등으로 다시 호출된 경우) False.
+
+    의도적으로 "먼저 선점 -> 그 다음에 실제 작업 수행" 순서를 씁니다. 즉 이번 실행이
+    중간에 실패(프로세스 죽음 등)하더라도 daily_run_log 행은 이미 남아있으므로,
+    **재시작해도 같은 날 같은 작업은 자동으로 다시 실행되지 않습니다.** 이는 "실패하면
+    안전하게 재시도"보다 "실패하면 사람이 확인하기 전까지는 멈춰있는 것"이 주문 중복
+    제출보다 낫다는 판단입니다(운영 런북의 "프로세스 중단 복구" 절차 참고 — 정말
+    재실행이 필요하면 daily_run_log에서 해당 행을 수동으로 지우고 재시작해야 합니다).
+    """
+    try:
+        conn.execute(
+            "INSERT INTO daily_run_log (run_type, run_date, claimed_at) VALUES (?, ?, ?)",
+            (run_type, run_date.isoformat(), datetime.now(timezone.utc).isoformat()),
+        )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 드라이런(주문 미제출, 로그만) 지원
+# ---------------------------------------------------------------------------
+
+
+def _submit_or_dry_run(
+    config: Config,
+    order: OrderIntent,
+    notifier: NotifierBase,
+    conn: sqlite3.Connection,
+    submitted_date: date,
+):
+    """config.dry_run에 따라 실제 제출 또는 로그 기록만 수행하는 공용 진입점.
+
+    모든 주문 제출은 반드시 이 함수를 거쳐야 합니다(kiwoom_adapter.submit_order_with_retry를
+    직접 호출하는 코드가 scheduler.py 안에 더 있으면 안 됨) — 드라이런 플래그가 새는
+    것을 막기 위한 단일 지점입니다.
+    """
+    if config.dry_run:
+        logger.info(
+            "[DRY-RUN] 주문 미제출 (실제 API 호출 없음): side=%s kind=%s price=%s qty=%s purpose=%s decoy=%s",
+            order.side,
+            order.order_kind,
+            order.price,
+            order.qty,
+            order.purpose,
+            order.is_decoy,
+        )
+        return None
+
+    try:
+        submitted = submit_order_with_retry(config, order, notifier=notifier)
+    except KiwoomAdapterError:
+        return None  # submit_order_with_retry가 이미 CRITICAL 알림을 보냈습니다.
+    _record_submitted_order(conn, submitted.order_no, order, submitted_date)
+    return submitted
+
+
 # ---------------------------------------------------------------------------
 # 체결 -> T값 갱신 이벤트 분류 (설계도 2번)
 # ---------------------------------------------------------------------------
@@ -125,6 +218,13 @@ def _classify_daily_events(
 ) -> list[str]:
     """오늘 확인된 체결들을 submitted_orders 장부와 대조해, event_log.EVENT_* 이벤트
     목록으로 변환합니다. 매칭에 사용한 submitted_orders 행은 여기서 정리(delete)합니다.
+
+    **부분체결 판정의 핵심**: "체결 비율(fill_ratio)"은 "체결된 주문들의 체결액 합"이
+    아니라 **"그 라운드에 제출된 모든 매수 주문의 의도 금액(buy_intended) 대비 실제
+    체결액(buy_filled)"**으로 계산해야 합니다. 예를 들어 전반전 절반매수(별지점+평단,
+    2건)에서 한쪽만 체결되면, 체결된 쪽만 보면 100%처럼 보이지만 전체 라운드 기준으로는
+    50%입니다. 그래서 buy_intended는 **fills에 등장했는지와 무관하게 submitted_orders에
+    남아있는 모든 매수-라운드 주문**을 기준으로 먼저 집계합니다(아래 1단계).
     """
     pending = _load_pending_orders(conn)
 
@@ -133,6 +233,16 @@ def _classify_daily_events(
     quarter_sell_filled = False
     limit_sell_filled = False
 
+    # 1단계: 오늘 매칭 대상인 매수-라운드 주문의 "의도 금액" 총합을 먼저 구합니다.
+    # 아직 체결되지 않은(=fills에 없는) 형제 주문도 반드시 포함해야 부분체결 비율이
+    # 정확해집니다.
+    for row in pending.values():
+        if row["is_decoy"]:
+            continue
+        if row["purpose"] in _BUY_ROUND_PURPOSES:
+            buy_intended += Decimal(row["qty"]) * Decimal(row["price"] or "0")
+
+    # 2단계: 실제 체결을 하나씩 대조합니다.
     for fill in fills:
         row = pending.get(fill.order_no)
         if row is None:
@@ -150,7 +260,6 @@ def _classify_daily_events(
                 f"시세 급등 등 예상 밖 상황일 수 있으니 즉시 확인하세요.",
             )
         elif purpose in _BUY_ROUND_PURPOSES:
-            buy_intended += Decimal(row["qty"]) * Decimal(row["price"] or "0")
             buy_filled += Decimal(fill.fill_qty) * fill.fill_price
         elif purpose == SELL_TYPE_QUARTER:
             quarter_sell_filled = True
@@ -203,6 +312,11 @@ def run_premarket_update(config: Config, conn: sqlite3.Connection, notifier: Not
     6) portfolio_summary 갱신
     """
     today = now_et().date()
+
+    if not _claim_daily_run(conn, "PREMARKET", today):
+        logger.info("오늘(%s)의 프리장 갱신은 이미 실행되었습니다. 중복 실행을 건너뜁니다.", today.isoformat())
+        return load_state(conn)
+
     logger.info("프리장 갱신 시작 (%s)", today.isoformat())
 
     try:
@@ -222,6 +336,15 @@ def run_premarket_update(config: Config, conn: sqlite3.Connection, notifier: Not
 
     if fills:
         state = _apply_fills(conn, config, state, fills, today, notifier)
+
+    # 체결과 매칭되지 못하고 남은(=체결 없이 취소된) 이전 주문 기록을 정리합니다.
+    # cancel_all_open_orders()가 이미 증권사 쪽 주문은 취소했으므로, 이 시점에도
+    # submitted_orders에 남아있는 "오늘 이전" 행은 앞으로도 절대 체결될 일이 없습니다.
+    # 여기서 정리하지 않으면 다음 실행의 _classify_daily_events() buy_intended 계산에
+    # 계속 끼어들어 체결 비율을 왜곡시킵니다.
+    purged = _purge_stale_submitted_orders(conn, before_date=today)
+    if purged:
+        logger.info("오늘 이전 미체결(취소됨) 주문 기록 %d건 정리 완료", purged)
 
     state = _handle_cycle_and_mode_transitions(conn, config, state, today, notifier)
     save_state(conn, state)
@@ -371,8 +494,7 @@ def _submit_limit_sell_order(
     orders = normal_mode.generate_sell_orders(state.avg_price, state.holding_qty, state.t, state.split_count)
     limit_orders = [o for o in orders if o.purpose == SELL_TYPE_LIMIT_15PCT]
     for order in limit_orders:
-        submitted = submit_order_with_retry(config, order, notifier=notifier)
-        _record_submitted_order(conn, submitted.order_no, order, today)
+        _submit_or_dry_run(config, order, notifier, conn, today)
 
 
 # ---------------------------------------------------------------------------
@@ -381,12 +503,23 @@ def _submit_limit_sell_order(
 
 
 def run_regular_session_orders(config: Config, conn: sqlite3.Connection, notifier: NotifierBase) -> None:
-    """본장 시작 시점에 1회 실행합니다 (설계도 5, 6, 7번). 그날의 LOC/MOC 주문을 제출합니다."""
+    """본장 시작 시점에 1회 실행합니다 (설계도 5, 6, 7번). 그날의 LOC/MOC 주문을 제출합니다.
+
+    시간대 체크(can_place_loc_or_moc_order)는 side-effect가 없는 순수 조건이므로 멱등성
+    선점(_claim_daily_run)보다 먼저 확인합니다 — 잘못된 시간에 호출되어 조기 반환하는
+    경우까지 "오늘 실행 완료"로 선점해버리면, 정작 본장 시간에 정상 호출됐을 때 이미
+    선점된 것으로 오판해 주문을 못 내는 사고로 이어지기 때문입니다.
+    """
     if not can_place_loc_or_moc_order():
         logger.info("LOC/MOC 주문 제출 가능 시간대(본장)가 아니므로 건너뜁니다.")
         return
 
     today = now_et().date()
+
+    if not _claim_daily_run(conn, "REGULAR", today):
+        logger.info("오늘(%s)의 본장 주문 제출은 이미 실행되었습니다. 중복 실행을 건너뜁니다.", today.isoformat())
+        return
+
     state = load_state(conn)
 
     orders: list[OrderIntent] = []
@@ -396,13 +529,9 @@ def run_regular_session_orders(config: Config, conn: sqlite3.Connection, notifie
         orders = _generate_reverse_mode_orders(config, state)
 
     for order in orders:
-        try:
-            submitted = submit_order_with_retry(config, order, notifier=notifier)
-        except KiwoomAdapterError:
-            continue  # submit_order_with_retry가 이미 CRITICAL 알림을 보냈습니다.
-        _record_submitted_order(conn, submitted.order_no, order, today)
+        _submit_or_dry_run(config, order, notifier, conn, today)
 
-    logger.info("본장 주문 제출 완료: %d건", len(orders))
+    logger.info("본장 주문 제출 완료: %d건 (dry_run=%s)", len(orders), config.dry_run)
 
 
 def _generate_normal_mode_orders(config: Config, state: State) -> list[OrderIntent]:
@@ -430,40 +559,97 @@ def _generate_reverse_mode_orders(config: Config, state: State) -> list[OrderInt
 # ---------------------------------------------------------------------------
 
 
+def _run_guarded(run_type: str, fn, config: Config, conn: sqlite3.Connection, notifier: NotifierBase) -> None:
+    """작업 실행을 감싸서, 처리되지 않은 예외(StateError/FormulaError/NormalModeError/
+    KiwoomAdapterError 등 무엇이든)가 나면 CRITICAL 알림을 보내고 다시 발생시킵니다
+    (설계도 11번 "자동매매 중단 + 알림"의 실제 트리거 지점입니다).
+
+    다시 발생시킨 예외는 APScheduler의 EVENT_JOB_ERROR로 전달되고, start_scheduler()에
+    등록된 리스너가 이를 받아 스케줄러 자체를 종료시킵니다. "로그만 남기고 다음 거래일에
+    자동으로 재시도"하지 않는 이유: 이 예외들은 대부분 일시적 네트워크 문제가 아니라
+    상태/로직 불일치를 의미하므로, 원인 파악 전에 자동으로 계속 도는 것이 더 위험합니다.
+    복구 절차는 운영 런북 문서의 "장애 복구 런북" 섹션을 참고하세요.
+    """
+    try:
+        fn(config, conn, notifier)
+    except Exception as exc:
+        logger.exception("%s 작업 중 처리되지 않은 예외가 발생했습니다.", run_type)
+        notifier.notify_critical(
+            f"{run_type} 작업 실패 - 자동매매 중단",
+            f"{type(exc).__name__}: {exc}\n\n조치 방법은 운영 런북의 '장애 복구' 절차를 참고하세요.",
+        )
+        raise
+
+
 def start_scheduler(config: Config | None = None, notifier: NotifierBase | None = None):
     """APScheduler에 프리장/본장 작업을 등록하고 블로킹 실행합니다.
 
     타임존을 America/New_York으로 고정한 cron 트리거를 쓰므로, 서머타임 전환일에도
     "현지 시각 04:00/09:30"이라는 의미가 자동으로 유지됩니다(설계도 11번).
+
+    작업 중 처리되지 않은 예외가 발생하면(_run_guarded 참고) EVENT_JOB_ERROR 리스너가
+    스케줄러를 즉시 종료시키고, 이 함수는 반환되며, 프로세스는 종료 코드 1로 끝납니다.
+    docker-compose.yml의 `restart: unless-stopped` 정책과 조합하면 컨테이너가 자동
+    재시작되는데, 원인이 일시적이면 다음 실행에서 정상화되지만 원인이 지속적(설정
+    오류, 상태 손상 등)이면 같은 실패가 반복되며 그때마다 CRITICAL 알림이 발생합니다.
+    반복 알림이 오면 재시작에 맡기지 말고 반드시 운영 런북대로 직접 원인을 조치하세요.
     """
+    from apscheduler.events import EVENT_JOB_ERROR
     from apscheduler.schedulers.blocking import BlockingScheduler
     from apscheduler.triggers.cron import CronTrigger
 
     from infinite_buying_v4.market_hours import MARKET_TZ, PREMARKET_START, REGULAR_START
 
-    config = config or load_config()
+    # notifier를 config보다 먼저 준비해둡니다 — load_config()/get_connection()이
+    # 실패해도(설정 누락, DB 경로 문제 등) 최소한 CRITICAL 로그를 남길 수 있도록
+    # 하기 위함입니다(그 전까지는 notifier 자체가 없어 어떤 알림도 남길 수 없었습니다).
     notifier = notifier or LogNotifier()
-    conn = db.get_connection(config.db_path)
+    try:
+        config = config or load_config()
+        conn = db.get_connection(config.db_path)
+    except Exception as exc:
+        logger.exception("설정/DB 초기화 실패로 스케줄러를 시작할 수 없습니다.")
+        notifier.notify_critical("설정/DB 초기화 실패 - 스케줄러 시작 불가", f"{type(exc).__name__}: {exc}")
+        raise
 
     scheduler = BlockingScheduler(timezone=MARKET_TZ)
+    shutdown_state = {"had_error": False}
+
+    def _on_job_error(event) -> None:
+        shutdown_state["had_error"] = True
+        logger.critical("작업 오류로 스케줄러를 종료합니다 (job_id=%s).", event.job_id)
+        scheduler.shutdown(wait=False)
+
+    scheduler.add_listener(_on_job_error, EVENT_JOB_ERROR)
 
     scheduler.add_job(
-        lambda: run_premarket_update(config, conn, notifier),
+        lambda: _run_guarded("PREMARKET", run_premarket_update, config, conn, notifier),
         trigger=CronTrigger(
             day_of_week="mon-fri", hour=PREMARKET_START.hour, minute=PREMARKET_START.minute, timezone=MARKET_TZ
         ),
         id="premarket_update",
     )
     scheduler.add_job(
-        lambda: run_regular_session_orders(config, conn, notifier),
+        lambda: _run_guarded("REGULAR", run_regular_session_orders, config, conn, notifier),
         trigger=CronTrigger(
             day_of_week="mon-fri", hour=REGULAR_START.hour, minute=REGULAR_START.minute, timezone=MARKET_TZ
         ),
         id="regular_session_orders",
     )
 
-    logger.info("스케줄러 시작: 프리장=%s ET, 본장=%s ET (America/New_York 기준)", PREMARKET_START, REGULAR_START)
+    logger.info(
+        "스케줄러 시작: 프리장=%s ET, 본장=%s ET (America/New_York 기준), dry_run=%s",
+        PREMARKET_START,
+        REGULAR_START,
+        config.dry_run,
+    )
     scheduler.start()
+
+    if shutdown_state["had_error"]:
+        import sys
+
+        logger.critical("작업 오류로 스케줄러가 종료되었습니다. 종료 코드 1로 프로세스를 종료합니다.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

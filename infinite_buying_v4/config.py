@@ -125,6 +125,16 @@ class Config:
     # --- 대시보드 ---
     dashboard_port: int
 
+    # --- 드라이런(모의 실행) 모드 ---
+    # KIWOOM_MODE(real/demo)와 완전히 독립된 별개의 안전장치입니다.
+    #   - KIWOOM_MODE=demo: 키움 "모의투자" 서버에 실제로 주문을 제출합니다(가상 잔고이지만
+    #     네트워크 호출과 체결 처리는 실제로 일어남).
+    #   - dry_run=True: 어떤 모드(real/demo)든, kiwoom_adapter.submit_order*()를 아예
+    #     호출하지 않습니다. OrderIntent 계산 결과만 로그로 출력하고 끝냅니다. 시세 조회
+    #     등 읽기 전용 API는 정상적으로 호출됩니다(가격 기반 로직을 실데이터로 검증하기 위함).
+    # 즉 "모의투자 + dry_run=False"와 "실투자 + dry_run=True"도 모두 유효한 조합입니다.
+    dry_run: bool
+
     def masked_app_secret(self) -> str:
         """로그에 App Secret 전체를 남기면 안 되므로, 마스킹된 값만 노출하는 헬퍼."""
         if len(self.app_secret) <= 4:
@@ -191,6 +201,8 @@ def load_config() -> Config:
             f"DASHBOARD_PORT는 정수여야 합니다 (입력값: '{dashboard_port_raw}')."
         ) from exc
 
+    dry_run = _get_bool_env("DRY_RUN", default=False)
+
     return Config(
         kiwoom_mode=kiwoom_mode,  # type: ignore[arg-type]  # 위에서 real/demo로 이미 검증함
         app_key=app_key,  # type: ignore[arg-type]
@@ -205,4 +217,5 @@ def load_config() -> Config:
         db_path=Path(db_path_raw),
         event_log_path=Path(event_log_path_raw),
         dashboard_port=dashboard_port,
+        dry_run=dry_run,
     )

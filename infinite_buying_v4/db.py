@@ -127,6 +127,21 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         is_decoy INTEGER NOT NULL DEFAULT 0
     )
     """,
+    # daily_run_log: scheduler.py의 멱등성(중복 실행 방지) 가드입니다.
+    # (run_type, run_date) 조합을 PRIMARY KEY로 걸어서, 같은 날 같은 종류의 작업
+    # (PREMARKET/REGULAR)이 두 번 "성공적으로 시작"할 수 없게 DB 레벨에서 강제합니다.
+    # INSERT 시점(작업 시작 직전)에 먼저 claim하고, 이미 존재하면(PK 충돌) 그날 그
+    # 작업은 이미 실행된 것으로 간주해 건너뜁니다. 컨테이너가 재시작돼도 이 테이블은
+    # data/ 볼륨에 영속화되어 있으므로 중복 제출을 막습니다. 자세한 판정 키와 복구
+    # 절차는 운영 런북 문서 참고.
+    """
+    CREATE TABLE IF NOT EXISTS daily_run_log (
+        run_type TEXT NOT NULL,                 -- "PREMARKET" | "REGULAR"
+        run_date TEXT NOT NULL,                 -- YYYY-MM-DD (America/New_York 기준 거래일)
+        claimed_at TEXT NOT NULL,               -- 이 작업을 시작 선점한 시각 (ISO8601)
+        PRIMARY KEY (run_type, run_date)
+    )
+    """,
     # 조회 성능을 위한 인덱스. cycle_id로 거래 이력을 자주 조회하므로(대시보드 등) 추가합니다.
     "CREATE INDEX IF NOT EXISTS idx_buy_records_cycle_id ON buy_records (cycle_id)",
     "CREATE INDEX IF NOT EXISTS idx_sell_records_cycle_id ON sell_records (cycle_id)",
