@@ -8,3 +8,19 @@ services:
       # SQLite DB, 이벤트 로그(JSONL)를 컨테이너 재시작/재빌드에도 유지하기 위한 볼륨.
       - ./data:/app/data
     restart: unless-stopped
+
+  dashboard:
+    build: .
+    container_name: infinite_buying_v4_dashboard
+    command: ["python", "-m", "infinite_buying_v4.dashboard.server"]
+    env_file:
+      - .env
+    volumes:
+      # infinite_buying 서비스와 같은 SQLite 파일을 읽기 전용으로 공유합니다
+      # (설계도 12-1번: "별도 계산 로직 중복 금지", 데이터는 그대로 읽기만 함).
+      - ./data:/app/data
+    ports:
+      # DASHBOARD_PORT(.env, 기본 8000)를 호스트에 그대로 노출합니다.
+      # 외부 인터넷 노출/인증은 설계도 범위 밖이므로 기본적으로 로컬/내부망 접속만 가정합니다.
+      - "${DASHBOARD_PORT:-8000}:${DASHBOARD_PORT:-8000}"
+    restart: unless-stopped

@@ -55,11 +55,10 @@ class _RecordingNotifier(NotifierBase):
 def _make_config(*, dry_run: bool = False, db_path: Path, event_log_path: Path) -> Config:
     """테스트용 최소 Config. load_config()의 .env 의존을 피하기 위해 직접 생성합니다."""
     return Config(
-        kiwoom_mode="demo",
         app_key="test-key",
         app_secret="test-secret",
-        api_base_url="https://mockapi.kiwoom.com",
-        ws_base_url="wss://mockapi.kiwoom.com:10000",
+        api_base_url="https://api.kiwoom.com",
+        ws_base_url="wss://api.kiwoom.com:10000",
         ticker="TQQQ",
         exchange_code="ND",
         split_count=40,

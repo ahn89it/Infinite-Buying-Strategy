@@ -4,13 +4,21 @@ config.py
 무한매수법 V4.0 자동매매 프로그램의 모든 환경설정 값을 한 곳에서 관리하는 모듈입니다.
 
 왜 이 모듈이 필요한가?
-- 원금, 분할수, 실투자/모의투자 여부, 키움 App Key/Secret 등은 코드에 하드코딩하면 안 되는
-  값들입니다(특히 App Secret 같은 민감정보, 원금처럼 사용자마다 다른 값).
+- 원금, 분할수, 키움 App Key/Secret 등은 코드에 하드코딩하면 안 되는 값들입니다
+  (특히 App Secret 같은 민감정보, 원금처럼 사용자마다 다른 값).
 - 대신 프로젝트 루트의 `.env` 파일(환경변수)에서 값을 읽어와 하나의 불변(frozen) 설정 객체로
   변환합니다. 이렇게 하면 다른 모든 모듈은 `config.py`만 import해서 값을 쓰면 되고,
   "환경변수를 어디서 어떻게 읽는지"를 몰라도 됩니다.
 - 설정값 검증(예: 분할수는 20 또는 40만 허용)도 이 모듈에서 프로그램 시작 시점에 한 번에
   끝내서, 잘못된 설정으로 인한 문제를 실행 초기에 바로 발견하게 합니다.
+
+중요: 이 프로젝트에 "모의투자" 옵션이 없는 이유
+- 키움증권 모의투자 서비스는 해외주식(미국주식) 매매를 지원하지 않습니다. 이 프로젝트는
+  TQQQ(미국주식)만을 대상으로 하므로, 애초에 모의투자 계좌로는 이 프로그램을 검증할 방법이
+  없습니다. 그래서 KIWOOM_MODE(real/demo) 같은 선택지를 두지 않고 항상 실투자(운영) API
+  엔드포인트만 사용합니다.
+- 실거래 전 로직을 검증하려면 모의투자 대신 `DRY_RUN=true` 설정(주문 제출 없이 계산 결과만
+  로그로 출력)을 사용하세요. `scheduler.py`/`kiwoom_adapter.py` 참고.
 """
 
 from __future__ import annotations
@@ -19,7 +27,6 @@ import os
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Literal
 
 # python-dotenv: .env 파일의 KEY=VALUE 라인들을 os.environ에 주입해주는 라이브러리.
 # 로컬 개발 시에는 .env 파일을 직접 읽고, Docker 운영 환경에서는 보통
@@ -32,17 +39,11 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
-# 키움 REST API의 실투자/모의투자 각각의 REST/WebSocket 엔드포인트입니다.
-# 공식 저장소(github.com/Kiwoom-Securities/Kiwoom-REST-API)의 .env.example 기준이며,
-# 사용자가 임의로 바꿀 이유가 없는 값이라 환경변수가 아닌 코드 상수로 고정합니다.
-_REST_BASE_URL = {
-    "real": "https://api.kiwoom.com",
-    "demo": "https://mockapi.kiwoom.com",
-}
-_WS_BASE_URL = {
-    "real": "wss://api.kiwoom.com:10000",
-    "demo": "wss://mockapi.kiwoom.com:10000",
-}
+# 키움 REST API 운영(실투자) 엔드포인트입니다. 모의투자는 해외주식을 지원하지 않아
+# 이 프로젝트에서는 선택지로 두지 않으므로, 환경변수가 아닌 고정 상수로 둡니다.
+# (공식 저장소: github.com/Kiwoom-Securities/Kiwoom-REST-API의 .env.example 기준)
+_API_BASE_URL = "https://api.kiwoom.com"
+_WS_BASE_URL = "wss://api.kiwoom.com:10000"
 
 # 무한매수법에서 허용하는 분할수는 20 또는 40 두 가지뿐입니다(설계도 1, 3, 4번).
 _VALID_SPLIT_COUNTS = (20, 40)
@@ -104,8 +105,7 @@ class Config:
     중간에 실수로 설정값이 바뀌는 사고를 원천 차단하기 위함입니다.
     """
 
-    # --- 키움 REST API 인증/환경 ---
-    kiwoom_mode: Literal["real", "demo"]  # "real"=실투자, "demo"=모의투자
+    # --- 키움 REST API 인증/환경 (항상 실투자. 모의투자는 해외주식 미지원이라 선택지 없음) ---
     app_key: str
     app_secret: str
     api_base_url: str
@@ -126,13 +126,11 @@ class Config:
     dashboard_port: int
 
     # --- 드라이런(모의 실행) 모드 ---
-    # KIWOOM_MODE(real/demo)와 완전히 독립된 별개의 안전장치입니다.
-    #   - KIWOOM_MODE=demo: 키움 "모의투자" 서버에 실제로 주문을 제출합니다(가상 잔고이지만
-    #     네트워크 호출과 체결 처리는 실제로 일어남).
-    #   - dry_run=True: 어떤 모드(real/demo)든, kiwoom_adapter.submit_order*()를 아예
-    #     호출하지 않습니다. OrderIntent 계산 결과만 로그로 출력하고 끝냅니다. 시세 조회
-    #     등 읽기 전용 API는 정상적으로 호출됩니다(가격 기반 로직을 실데이터로 검증하기 위함).
-    # 즉 "모의투자 + dry_run=False"와 "실투자 + dry_run=True"도 모두 유효한 조합입니다.
+    # 모의투자 계좌가 없는 이 프로젝트에서 "실주문 없이 로직만 검증"할 수 있는 유일한
+    # 안전장치입니다. True면 kiwoom_adapter.submit_order*()를 아예 호출하지 않고,
+    # OrderIntent 계산 결과만 로그로 출력하고 끝냅니다. 시세 조회 등 읽기 전용 API는
+    # 정상적으로 호출됩니다(실계좌 실데이터로 가격 기반 로직을 검증하기 위함).
+    # 실투자 전환 전에는 반드시 DRY_RUN=true로 최소 수 거래일 이상 로그를 확인하세요.
     dry_run: bool
 
     def masked_app_secret(self) -> str:
@@ -149,20 +147,8 @@ def load_config() -> Config:
     딱 한 번 호출하고, 이후에는 반환된 Config 객체를 계속 재사용하는 것을
     권장합니다(환경변수를 매번 다시 읽지 않도록).
     """
-    kiwoom_mode = _get_env("KIWOOM_MODE", required=False, default="demo")
-    if kiwoom_mode not in ("real", "demo"):
-        raise ConfigError(
-            f"KIWOOM_MODE는 'real' 또는 'demo'만 허용됩니다 (입력값: '{kiwoom_mode}')."
-        )
-
-    # real/demo 모드에 따라 App Key/Secret 환경변수 이름이 다릅니다.
-    # (키움 공식 가이드: 운영과 모의투자는 서로 다른 키를 발급받아야 함)
-    if kiwoom_mode == "real":
-        app_key = _get_env("APP_KEY")
-        app_secret = _get_env("APP_SECRET")
-    else:
-        app_key = _get_env("APP_KEY_MOCK")
-        app_secret = _get_env("APP_SECRET_MOCK")
+    app_key = _get_env("APP_KEY")
+    app_secret = _get_env("APP_SECRET")
 
     split_count_raw = _get_env("SPLIT_COUNT", required=False, default="40")
     try:
@@ -204,11 +190,10 @@ def load_config() -> Config:
     dry_run = _get_bool_env("DRY_RUN", default=False)
 
     return Config(
-        kiwoom_mode=kiwoom_mode,  # type: ignore[arg-type]  # 위에서 real/demo로 이미 검증함
         app_key=app_key,  # type: ignore[arg-type]
         app_secret=app_secret,  # type: ignore[arg-type]
-        api_base_url=_REST_BASE_URL[kiwoom_mode],
-        ws_base_url=_WS_BASE_URL[kiwoom_mode],
+        api_base_url=_API_BASE_URL,
+        ws_base_url=_WS_BASE_URL,
         ticker=ticker,  # type: ignore[arg-type]
         exchange_code=exchange_code,
         split_count=split_count,

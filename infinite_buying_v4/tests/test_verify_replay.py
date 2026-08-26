@@ -43,9 +43,8 @@ def isolated_env(tmp_path: Path, monkeypatch):
     """load_config()가 이 테스트 전용 .env/DB/이벤트로그를 보도록 격리합니다."""
     db_path = tmp_path / "test.db"
     event_log_path = tmp_path / "event_log.jsonl"
-    monkeypatch.setenv("KIWOOM_MODE", "demo")
-    monkeypatch.setenv("APP_KEY_MOCK", "x")
-    monkeypatch.setenv("APP_SECRET_MOCK", "x")
+    monkeypatch.setenv("APP_KEY", "x")
+    monkeypatch.setenv("APP_SECRET", "x")
     monkeypatch.setenv("SPLIT_COUNT", "40")
     monkeypatch.setenv("PRINCIPAL", "10000")
     monkeypatch.setenv("DB_PATH", str(db_path))

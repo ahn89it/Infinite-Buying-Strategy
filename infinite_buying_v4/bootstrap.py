@@ -15,8 +15,11 @@ bootstrap.py
 사용법 (프로젝트 루트에서):
     python -m infinite_buying_v4.bootstrap
 
-.env에 KIWOOM_MODE, SPLIT_COUNT, PRINCIPAL 등이 이미 설정되어 있어야 합니다
-(config.py 참고). 실행하면:
+.env에 APP_KEY, APP_SECRET, SPLIT_COUNT, PRINCIPAL 등이 이미 설정되어 있어야 합니다
+(config.py 참고). 키움 모의투자는 해외주식을 지원하지 않으므로 이 프로젝트는 항상
+실투자 API를 사용합니다 — 실주문 없이 먼저 점검하려면 .env에 DRY_RUN=true를
+설정한 뒤 scheduler.py를 실행해 로그를 확인하세요(이 bootstrap 스크립트 자체는
+주문을 내지 않으므로 DRY_RUN과 무관하게 항상 안전합니다). 실행하면:
     1) state 테이블에 T=0, 보유 0, 사이클 1번 상태를 생성하고
     2) cycle_summary에 사이클 1번의 "진행 중" 행을 만들고
     3) portfolio_summary 싱글턴 행을 초기화합니다.
@@ -63,10 +66,11 @@ def main() -> None:
         )
 
         logger.info(
-            "무한매수법 신규 시작 완료: split_count=%d, principal=%s, mode=%s, start_date=%s",
+            "무한매수법 신규 시작 완료: split_count=%d, principal=%s, ticker=%s, dry_run=%s, start_date=%s",
             state.split_count,
             state.principal,
-            config.kiwoom_mode,
+            config.ticker,
+            config.dry_run,
             start_date.isoformat(),
         )
     finally:

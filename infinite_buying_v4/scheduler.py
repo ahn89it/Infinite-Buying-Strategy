@@ -31,7 +31,9 @@ normal_mode.py, reverse_mode.py, market_hours.py, kiwoom_adapter.py, notifier.py
   _claim_daily_run()으로 (run_type, 오늘날짜)를 선점합니다. 이미 선점되어 있으면(=오늘
   이미 실행됨, 컨테이너 재시작 등) 아무 side-effect 없이 즉시 반환합니다.
 - 드라이런: config.dry_run=True면 모든 주문 제출이 _submit_or_dry_run()을 통해 실제
-  API 호출 없이 로그로만 남습니다. KIWOOM_MODE(real/demo)와는 독립된 별개의 플래그입니다.
+  API 호출 없이 로그로만 남습니다. 키움 모의투자는 해외주식을 지원하지 않아 이
+  프로젝트에는 모의투자 모드가 없으므로(항상 실투자 API 사용), DRY_RUN이 실거래 전
+  로직을 검증하는 유일한 안전장치입니다.
 - 예외 정책: 이 모듈의 함수가 처리하지 않고 밖으로 던지는 예외(_run_guarded가 감쌈)는
   전부 "자동매매 중단" 대상입니다. CRITICAL 알림을 보낸 뒤 스케줄러 자체를 종료시킵니다
   (다음날 조용히 재시도하지 않음).

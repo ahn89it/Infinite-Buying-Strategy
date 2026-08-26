@@ -10,10 +10,18 @@ kiwoom_adapter.py
 (별지점 LOC매수, 쿼터매도, 지정가매도, MOC매도, 체결 조회/구독, 우리 프로젝트만의
 주문 실패 재시도 정책)를 새로 작성합니다.
 
+중요: 이 어댑터는 항상 키움 REST API "실투자(운영)" 엔드포인트만 사용합니다. 키움
+모의투자는 해외주식(미국주식) 매매를 지원하지 않아서, 이 프로젝트에는 모의투자 모드
+자체가 없습니다(config.py 참고). 실주문 없이 로직만 점검하려면 `.env`의
+`DRY_RUN=true` 설정을 사용하세요 — `submit_order_with_retry()`를 호출하는
+`scheduler.py` 쪽에서 실제 제출을 건너뛰고 계산 결과만 로그로 남깁니다. 이 모듈의
+시세/체결 조회 함수들은 DRY_RUN 여부와 무관하게 항상 실계좌 데이터를 그대로
+반환합니다(읽기 전용이라 안전).
+
 사전 준비 (사용자가 직접 해야 하는 일, Claude Code가 대신할 수 없음):
-1. 키움증권 OpenAPI 포털에서 App Key/Secret 발급 (실투자/모의투자 각각)
+1. 키움증권 OpenAPI 포털에서 실투자용 App Key/Secret 발급
 2. `pip install kwcli` (requirements.txt에 포함됨)
-3. `.env`에 KIWOOM_MODE, APP_KEY(_MOCK), APP_SECRET(_MOCK) 설정 (config.py 참고)
+3. `.env`에 APP_KEY, APP_SECRET 설정 (config.py 참고)
 4. kwcli의 인증 저장 방식(OS 자격 증명 저장소 또는 .env)에 맞춰 최초 1회 토큰 발급 확인
 
 주의(실거래 전 반드시 확인):
@@ -23,7 +31,9 @@ kiwoom_adapter.py
   대조하세요.
 - 실시간 체결통보(F5)의 필드 코드 "907"(매도수구분) 값의 매도/매수 구분(0/1 등)은
   REST 조회 API의 `slby_tp`(0:전체,1:매도,2:매수) 규칙과 동일하다고 가정했습니다.
-  실전 투입 전 모의투자로 실제 수신값을 로그로 찍어 확인하는 것을 권장합니다.
+  모의투자로 사전 검증할 수 없으므로, `DRY_RUN=true` 상태로 실계좌 시세는 그대로
+  받으며 실제 수신값을 로그로 찍어 확인한 뒤, 최소 수량으로 실주문 1건을 내서
+  직접 검증하는 것을 권장합니다.
 """
 
 from __future__ import annotations

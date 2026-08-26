@@ -10,3 +10,7 @@ python-dotenv>=1.0.0
 # 매일 프리장/본장 시작 시각에 맞춰 자동 실행을 예약하기 위해 사용합니다 (scheduler.py).
 # America/New_York 타임존 cron 트리거를 지원해 서머타임 전환을 자동으로 반영합니다.
 APScheduler>=3.10.0
+
+# 로컬 대시보드(dashboard/server.py)용 경량 웹서버. SQLite를 읽기 전용으로 조회해
+# JSON API + 정적 HTML 한 페이지만 제공하는 용도라 가장 가벼운 선택지로 골랐습니다.
+Flask>=3.0.0
