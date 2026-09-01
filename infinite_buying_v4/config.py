@@ -39,6 +39,15 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
+# 중요: 공식 kwcli 패키지(kiwoom_adapter.py가 사용하는 get_client()/get_auth() 등)는
+# 우리 Config와는 별개로, 자기 자신의 환경변수 KIWOOM_MODE를 읽어 real/demo와
+# APP_KEY(_MOCK)/APP_SECRET(_MOCK) 중 무엇을 쓸지 스스로 판단합니다. 이 값이
+# 없고 kiwoomcli setup으로 만든 프로필도 없으면 kwcli는 ModeNotConfiguredError를
+# 던집니다. 이 프로젝트는 모의투자를 지원하지 않아(위 설명 참고) 항상 "real"이어야
+# 하므로, 사용자가 .env에 이 값을 넣거나 빠뜨리는 것과 무관하게 여기서 강제로
+# 고정합니다 — kwcli 관점에서도 "선택지 없음"을 코드로 보장하기 위함입니다.
+os.environ["KIWOOM_MODE"] = "real"
+
 # 키움 REST API 운영(실투자) 엔드포인트입니다. 모의투자는 해외주식을 지원하지 않아
 # 이 프로젝트에서는 선택지로 두지 않으므로, 환경변수가 아닌 고정 상수로 둡니다.
 # (공식 저장소: github.com/Kiwoom-Securities/Kiwoom-REST-API의 .env.example 기준)
