@@ -39,9 +39,12 @@ logger = logging.getLogger("infinite_buying_v4.bootstrap")
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
     config = load_config()
+
+    from infinite_buying_v4.logging_setup import configure_logging
+
+    configure_logging(config)  # 콘솔 + data/logs/app.log 파일에 동시 기록
+
     conn = db.get_connection(config.db_path)
     try:
         if state_exists(conn):

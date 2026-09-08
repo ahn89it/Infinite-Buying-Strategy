@@ -62,8 +62,10 @@ def create_app(config: Config | None = None) -> Flask:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     config = load_config()
+    from infinite_buying_v4.logging_setup import configure_logging
+
+    configure_logging(config)  # 콘솔 + data/logs/app.log 파일에 동시 기록
     app = create_app(config)
     logger.info("대시보드 서버 시작: http://0.0.0.0:%d (Ctrl+C로 종료)", config.dashboard_port)
     app.run(host="0.0.0.0", port=config.dashboard_port)

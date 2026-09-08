@@ -655,5 +655,8 @@ def start_scheduler(config: Config | None = None, notifier: NotifierBase | None 
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    start_scheduler()
+    from infinite_buying_v4.logging_setup import configure_logging
+
+    _config = load_config()
+    configure_logging(_config)  # 콘솔 + data/logs/app.log 파일에 동시 기록
+    start_scheduler(_config)
