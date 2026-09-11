@@ -81,6 +81,17 @@
   <div class="grid" id="cycle-cards"></div>
 </section>
 
+<section id="today-orders-section">
+  <h2>오늘의 주문 현황</h2>
+  <div id="today-orders-wrap"></div>
+  <div class="note">
+    "체결 대기 중"은 오늘 제출됐지만 아직 체결이 확인되지 않은 주문입니다(다음 갱신에서 체결로
+    바뀌거나, 장 마감까지 안 되면 미체결로 남습니다). "미끼주문"은 실제 체결 목적이 아니라
+    증권사 주문가 제한을 우회하기 위한 장치입니다. 대기 중이던 주문이 다음 날 이 목록에서
+    조용히 사라졌다면, 체결되지 않고 취소(정리)된 것일 수 있습니다.
+  </div>
+</section>
+
 <section id="trades-section">
   <h2>최근 거래 (최대 20건)</h2>
   <div id="trades-table-wrap"></div>
@@ -111,6 +122,23 @@ function pctClass(v) {
 function fmtNum(v, digits = 4) {
   if (v === null || v === undefined) return "-";
   return v.toFixed(digits).replace(/\.?0+$/, "") || "0";
+}
+
+// 로그를 볼 수 없는 사람도 주문 유형을 알아볼 수 있도록, DB의 내부 코드(purpose/order_type)를
+// 한글로 바꿔 보여줍니다. 매핑에 없는 코드는 원본 코드를 그대로 보여줍니다.
+const PURPOSE_LABELS = {
+  FIRST: "첫매수",
+  HALF_STAR: "전반전 별지점 매수",
+  HALF_AVG: "전반전 평단가 매수",
+  FULL_STAR: "후반전 별지점 매수",
+  REVERSE: "리버스모드 매수",
+  QUARTER: "쿼터매도",
+  LIMIT_15PCT: "지정가매도(+15%)",
+  REVERSE_MOC: "리버스모드 매도(MOC)",
+  REVERSE_LOC: "리버스모드 매도(LOC)",
+};
+function purposeLabel(code) {
+  return PURPOSE_LABELS[code] || code;
 }
 
 function card(label, value, sub, valueClass) {
@@ -173,7 +201,7 @@ function renderTrades(trades) {
       <td class="${t.side === 'BUY' ? 'side-buy' : 'side-sell'}">${t.side === 'BUY' ? '매수' : '매도'}</td>
       <td>${fmtMoney(t.price)}</td>
       <td>${t.qty}</td>
-      <td>${t.order_type}</td>
+      <td>${purposeLabel(t.order_type)}</td>
       <td>${t.profit_amount !== null ? fmtMoney(t.profit_amount) : '-'}</td>
       <td class="${pctClass(t.return_pct)}">${t.return_pct !== null ? fmtPct(t.return_pct) : '-'}</td>
     </tr>`).join("");
@@ -181,6 +209,51 @@ function renderTrades(trades) {
     <thead><tr><th>날짜</th><th>구분</th><th>가격</th><th>수량</th><th>유형</th><th>수익금</th><th>수익률</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
+}
+
+function renderTodayOrders(todayOrders) {
+  const wrap = document.getElementById("today-orders-wrap");
+  if (!todayOrders || (todayOrders.filled.length === 0 && todayOrders.pending.length === 0)) {
+    wrap.innerHTML = `<div class="empty">오늘 제출된 주문이 아직 없습니다.</div>`;
+    return;
+  }
+
+  let html = "";
+
+  if (todayOrders.filled.length > 0) {
+    const rows = todayOrders.filled.map(t => `
+      <tr>
+        <td class="${t.side === 'BUY' ? 'side-buy' : 'side-sell'}">${t.side === 'BUY' ? '매수' : '매도'}</td>
+        <td>${purposeLabel(t.order_type)}</td>
+        <td>${fmtMoney(t.price)}</td>
+        <td>${t.qty}</td>
+        <td>${t.profit_amount !== null ? fmtMoney(t.profit_amount) : '-'}</td>
+        <td class="${pctClass(t.return_pct)}">${t.return_pct !== null ? fmtPct(t.return_pct) : '-'}</td>
+      </tr>`).join("");
+    html += `<div class="sub" style="margin-bottom:6px;">&#9989; 체결완료 (${todayOrders.filled.length}건)</div>
+      <table>
+        <thead><tr><th>구분</th><th>유형</th><th>체결가</th><th>수량</th><th>수익금</th><th>수익률</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  if (todayOrders.pending.length > 0) {
+    const rows = todayOrders.pending.map(o => `
+      <tr>
+        <td class="${o.side === 'BUY' ? 'side-buy' : 'side-sell'}">${o.side === 'BUY' ? '매수' : '매도'}</td>
+        <td>${purposeLabel(o.purpose)}${o.is_decoy ? ' <span class="badge" style="background:rgba(240,184,70,0.15);color:var(--amber);">미끼주문</span>' : ''}</td>
+        <td>${o.order_kind}</td>
+        <td>${o.price !== null ? fmtMoney(o.price) : '시장가'}</td>
+        <td>${o.qty}</td>
+      </tr>`).join("");
+    html += `<div class="sub" style="margin:${todayOrders.filled.length ? '16px' : '0'} 0 6px;">&#9203; 체결 대기 중 (${todayOrders.pending.length}건)</div>
+      <table>
+        <thead><tr><th>구분</th><th>유형</th><th>주문방식</th><th>주문가</th><th>수량</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  wrap.innerHTML = html;
 }
 
 function renderCycleChart(history) {
@@ -219,6 +292,7 @@ async function refresh() {
     const data = await res.json();
     renderSummary(data.portfolio);
     renderCycle(data.cycle);
+    renderTodayOrders(data.today_orders);
     renderTrades(data.recent_trades);
     renderCycleChart(data.cycle_history);
     document.getElementById("last-updated").textContent =

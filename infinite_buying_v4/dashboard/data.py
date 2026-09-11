@@ -210,6 +210,70 @@ def get_cycle_history(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     ]
 
 
+def get_today_order_activity(conn: sqlite3.Connection, *, today: date) -> dict[str, Any]:
+    """오늘 제출된 주문 중 "이미 체결된 것"과 "아직 체결 대기 중인 것"을 구분해서 반환합니다.
+
+    `get_recent_trades()`(최근 거래 내역)는 **체결이 확인된 것만** 보여주므로, "오늘
+    주문은 냈는데 아직 체결 안 된 것"은 거기 나타나지 않습니다. 로그를 볼 수 없는
+    사람도 대시보드만으로 "오늘 무슨 주문이 나갔고 그중 뭐가 체결됐는지"를 전부
+    파악할 수 있도록 이 함수를 별도로 둡니다.
+
+    - `filled`: buy_records/sell_records 중 오늘 날짜인 것 (이미 체결 확정)
+    - `pending`: submitted_orders 중 오늘 제출된 것 (아직 체결 매칭 전 = 대기 중)
+
+    주의(한계): 오늘 제출됐다가 끝내 체결되지 않고 취소된 주문은, 다음 프리장 실행
+    시점에 submitted_orders에서 조용히 정리(purge)되어 "취소됨"이라는 기록을 남기지
+    않습니다 — 그 시점부터는 이 함수에도, 다른 어디에도 나타나지 않습니다(내일이
+    되면 오늘 대기 중이던 항목이 사라진 것으로만 알 수 있음, 아직 별도 이력화는
+    구현하지 않음).
+    """
+    filled_rows = conn.execute(
+        """
+        SELECT * FROM (
+            SELECT buy_date AS trade_date, 'BUY' AS side, buy_price AS price, buy_qty AS qty,
+                   order_type, NULL AS profit_amount, NULL AS return_pct, created_at
+            FROM buy_records WHERE buy_date = ?
+            UNION ALL
+            SELECT sell_date AS trade_date, 'SELL' AS side, sell_price AS price, sell_qty AS qty,
+                   order_type, profit_amount, return_pct, created_at
+            FROM sell_records WHERE sell_date = ?
+        )
+        ORDER BY created_at ASC
+        """,
+        (today.isoformat(), today.isoformat()),
+    ).fetchall()
+
+    pending_rows = conn.execute(
+        "SELECT * FROM submitted_orders WHERE submitted_date = ? ORDER BY side, purpose",
+        (today.isoformat(),),
+    ).fetchall()
+
+    return {
+        "filled": [
+            {
+                "side": row["side"],
+                "price": _to_float(Decimal(row["price"])),
+                "qty": row["qty"],
+                "order_type": row["order_type"],
+                "profit_amount": _to_float(Decimal(row["profit_amount"])) if row["profit_amount"] is not None else None,
+                "return_pct": _to_float(Decimal(row["return_pct"])) if row["return_pct"] is not None else None,
+            }
+            for row in filled_rows
+        ],
+        "pending": [
+            {
+                "side": row["side"],
+                "order_kind": row["order_kind"],
+                "price": _to_float(Decimal(row["price"])) if row["price"] is not None else None,
+                "qty": row["qty"],
+                "purpose": row["purpose"],
+                "is_decoy": bool(row["is_decoy"]),
+            }
+            for row in pending_rows
+        ],
+    }
+
+
 def build_dashboard_payload(conn: sqlite3.Connection, *, today: date) -> dict[str, Any]:
     """대시보드 프런트엔드가 한 번의 요청으로 받아가는 전체 JSON 페이로드를 조립합니다.
 
@@ -221,5 +285,6 @@ def build_dashboard_payload(conn: sqlite3.Connection, *, today: date) -> dict[st
         "cycle": get_current_cycle_status(conn, today=today),
         "recent_trades": get_recent_trades(conn),
         "cycle_history": get_cycle_history(conn),
+        "today_orders": get_today_order_activity(conn, today=today),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }

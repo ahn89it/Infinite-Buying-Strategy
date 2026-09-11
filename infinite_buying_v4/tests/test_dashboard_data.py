@@ -22,6 +22,7 @@ from infinite_buying_v4.dashboard.data import (
     get_cycle_history,
     get_portfolio_summary,
     get_recent_trades,
+    get_today_order_activity,
 )
 from infinite_buying_v4.state import (
     MODE_NORMAL,
@@ -37,6 +38,18 @@ def conn(tmp_path: Path):
     connection = db.get_connection(tmp_path / "test.db")
     yield connection
     connection.close()
+
+
+def _seed_submitted_order(
+    conn, order_no: str, *, submitted_date: date, side: str, order_kind: str, price, qty: int, purpose: str, is_decoy: bool = False
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO submitted_orders (order_no, submitted_date, side, order_kind, price, qty, purpose, is_decoy)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (order_no, submitted_date.isoformat(), side, order_kind, str(price) if price is not None else None, qty, purpose, int(is_decoy)),
+    )
 
 
 def test_get_portfolio_summary_returns_none_before_bootstrap(conn) -> None:
@@ -210,13 +223,107 @@ def test_get_cycle_history_excludes_open_cycles(conn) -> None:
     assert history[0]["cycle_return_pct"] == pytest.approx(20.0)
 
 
+def test_get_today_order_activity_separates_filled_and_pending(conn) -> None:
+    today = date(2026, 8, 3)
+
+    # 오늘 이미 체결된 매수 1건
+    th.record_buy(
+        conn,
+        cycle_id=1,
+        buy_date=today,
+        buy_price=Decimal("50.00"),
+        buy_qty=10,
+        order_type=th.BUY_TYPE_HALF_STAR,
+        t_after=Decimal("1"),
+        avg_price_after=Decimal("50.00"),
+    )
+    # 오늘 제출됐지만 아직 체결 매칭 전인 주문 1건 (submitted_orders에만 존재)
+    _seed_submitted_order(
+        conn,
+        "ORD-PENDING-1",
+        submitted_date=today,
+        side="SELL",
+        order_kind="LIMIT",
+        price=Decimal("57.50"),
+        qty=75,
+        purpose=th.SELL_TYPE_LIMIT_15PCT,
+    )
+
+    activity = get_today_order_activity(conn, today=today)
+    assert len(activity["filled"]) == 1
+    assert activity["filled"][0]["side"] == "BUY"
+    assert activity["filled"][0]["order_type"] == th.BUY_TYPE_HALF_STAR
+
+    assert len(activity["pending"]) == 1
+    assert activity["pending"][0]["side"] == "SELL"
+    assert activity["pending"][0]["purpose"] == th.SELL_TYPE_LIMIT_15PCT
+    assert activity["pending"][0]["price"] == pytest.approx(57.50)
+    assert activity["pending"][0]["is_decoy"] is False
+
+
+def test_get_today_order_activity_excludes_other_days(conn) -> None:
+    today = date(2026, 8, 3)
+    yesterday = date(2026, 8, 2)
+
+    th.record_buy(
+        conn,
+        cycle_id=1,
+        buy_date=yesterday,
+        buy_price=Decimal("48.00"),
+        buy_qty=10,
+        order_type=th.BUY_TYPE_FIRST,
+        t_after=Decimal("1"),
+        avg_price_after=Decimal("48.00"),
+    )
+    _seed_submitted_order(
+        conn,
+        "ORD-YESTERDAY",
+        submitted_date=yesterday,
+        side="BUY",
+        order_kind="LOC",
+        price=Decimal("49.00"),
+        qty=5,
+        purpose=th.BUY_TYPE_FIRST,
+    )
+
+    activity = get_today_order_activity(conn, today=today)
+    assert activity["filled"] == []
+    assert activity["pending"] == []
+
+
+def test_get_today_order_activity_flags_decoy_orders(conn) -> None:
+    today = date(2026, 8, 3)
+    _seed_submitted_order(
+        conn,
+        "ORD-DECOY",
+        submitted_date=today,
+        side="BUY",
+        order_kind="LOC",
+        price=Decimal("60.00"),
+        qty=1,
+        purpose=th.BUY_TYPE_FIRST,
+        is_decoy=True,
+    )
+
+    activity = get_today_order_activity(conn, today=today)
+    assert activity["pending"][0]["is_decoy"] is True
+
+
 def test_build_dashboard_payload_assembles_all_sections(conn) -> None:
     bootstrap_new_state(conn, split_count=40, principal=Decimal("10000"), start_date=date(2026, 8, 3))
     th.ensure_portfolio_summary(conn, strategy_start_date=date(2026, 8, 3), initial_principal=Decimal("10000"))
 
     payload = build_dashboard_payload(conn, today=date(2026, 8, 3))
-    assert set(payload.keys()) == {"portfolio", "cycle", "recent_trades", "cycle_history", "generated_at"}
+    assert set(payload.keys()) == {
+        "portfolio",
+        "cycle",
+        "recent_trades",
+        "cycle_history",
+        "today_orders",
+        "generated_at",
+    }
     assert payload["portfolio"] is not None
     assert payload["cycle"] is not None
     assert payload["recent_trades"] == []
     assert payload["cycle_history"] == []
+    assert payload["today_orders"] == {"filled": [], "pending": []}
