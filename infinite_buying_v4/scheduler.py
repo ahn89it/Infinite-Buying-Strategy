@@ -127,15 +127,46 @@ def _purge_submitted_order(conn: sqlite3.Connection, order_no: str) -> None:
     conn.execute("DELETE FROM submitted_orders WHERE order_no = ?", (order_no,))
 
 
+def _archive_cancelled_order(conn: sqlite3.Connection, row: sqlite3.Row, *, cancelled_date: date) -> None:
+    """submitted_orders 행 하나를 지우기 직전에 cancelled_orders로 영구 이력화합니다."""
+    conn.execute(
+        """
+        INSERT INTO cancelled_orders
+            (order_no, submitted_date, cancelled_date, side, order_kind, price, qty, purpose, is_decoy, recorded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            row["order_no"],
+            row["submitted_date"],
+            cancelled_date.isoformat(),
+            row["side"],
+            row["order_kind"],
+            row["price"],
+            row["qty"],
+            row["purpose"],
+            row["is_decoy"],
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+
 def _purge_stale_submitted_orders(conn: sqlite3.Connection, *, before_date: date) -> int:
     """before_date보다 이전에 제출됐지만 체결 매칭이 안 된(=취소된) 주문 기록을 정리합니다.
+
+    삭제하기 직전에 각 행을 `cancelled_orders`로 옮겨 담아 영구 이력을 남깁니다 —
+    이전에는 그냥 삭제만 해서 "이 주문이 취소됐다"는 사실 자체가 사라졌습니다.
 
     반드시 _classify_daily_events()로 그날의 체결 매칭을 **끝낸 뒤에만** 호출해야 합니다
     (먼저 지우면 매칭할 대상 자체가 사라져 버립니다). 정리하지 않고 방치하면 다음 실행의
     부분체결 비율 계산(buy_intended)에 예전 주문이 계속 끼어들어 결과가 왜곡됩니다.
     """
-    cursor = conn.execute("DELETE FROM submitted_orders WHERE submitted_date < ?", (before_date.isoformat(),))
-    return cursor.rowcount
+    stale_rows = conn.execute(
+        "SELECT * FROM submitted_orders WHERE submitted_date < ?", (before_date.isoformat(),)
+    ).fetchall()
+    for row in stale_rows:
+        _archive_cancelled_order(conn, row, cancelled_date=before_date)
+    conn.execute("DELETE FROM submitted_orders WHERE submitted_date < ?", (before_date.isoformat(),))
+    return len(stale_rows)
 
 
 # ---------------------------------------------------------------------------

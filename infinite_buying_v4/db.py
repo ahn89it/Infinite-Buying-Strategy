@@ -127,6 +127,27 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         is_decoy INTEGER NOT NULL DEFAULT 0
     )
     """,
+    # cancelled_orders: submitted_orders에서 체결 매칭 없이 정리(purge)되는 주문의 영구
+    # 이력입니다. submitted_orders는 "아직 살아있는 주문"만 담는 작업용 장부라 매칭되면
+    # 지워지고, 매칭 없이 오래되면(=취소된 것으로 간주) 그냥 삭제됐었습니다 — 그러면
+    # "이 주문이 취소됐다"는 사실 자체가 사라져서, 대시보드나 사람이 나중에 확인할 방법이
+    # 없었습니다. 그래서 삭제하기 직전에 이 테이블로 옮겨 담아(scheduler.py의
+    # _purge_stale_submitted_orders 참고) 영구히 남깁니다.
+    """
+    CREATE TABLE IF NOT EXISTS cancelled_orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_no TEXT NOT NULL,
+        submitted_date TEXT NOT NULL,           -- 원래 제출된 날짜
+        cancelled_date TEXT NOT NULL,           -- 취소(정리)로 확정된 날짜 (다음 프리장 실행일)
+        side TEXT NOT NULL,
+        order_kind TEXT NOT NULL,
+        price TEXT,
+        qty INTEGER NOT NULL,
+        purpose TEXT NOT NULL,
+        is_decoy INTEGER NOT NULL DEFAULT 0,
+        recorded_at TEXT NOT NULL               -- 이 이력이 기록된 시각 (ISO8601)
+    )
+    """,
     # daily_run_log: scheduler.py의 멱등성(중복 실행 방지) 가드입니다.
     # (run_type, run_date) 조합을 PRIMARY KEY로 걸어서, 같은 날 같은 종류의 작업
     # (PREMARKET/REGULAR)이 두 번 "성공적으로 시작"할 수 없게 DB 레벨에서 강제합니다.
@@ -145,6 +166,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     # 조회 성능을 위한 인덱스. cycle_id로 거래 이력을 자주 조회하므로(대시보드 등) 추가합니다.
     "CREATE INDEX IF NOT EXISTS idx_buy_records_cycle_id ON buy_records (cycle_id)",
     "CREATE INDEX IF NOT EXISTS idx_sell_records_cycle_id ON sell_records (cycle_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cancelled_orders_cancelled_date ON cancelled_orders (cancelled_date)",
 )
 
 

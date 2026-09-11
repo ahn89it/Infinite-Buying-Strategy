@@ -9,7 +9,7 @@ Flask 없이(HTTP 서버를 띄우지 않고) SQLite 데이터만으로 검증�
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -22,6 +22,7 @@ from infinite_buying_v4.dashboard.data import (
     get_cycle_history,
     get_portfolio_summary,
     get_recent_trades,
+    get_recent_cancelled_orders,
     get_today_order_activity,
 )
 from infinite_buying_v4.state import (
@@ -309,6 +310,67 @@ def test_get_today_order_activity_flags_decoy_orders(conn) -> None:
     assert activity["pending"][0]["is_decoy"] is True
 
 
+def _seed_cancelled_order(
+    conn, order_no: str, *, submitted_date: date, cancelled_date: date, side: str, order_kind: str, price, qty: int, purpose: str, is_decoy: bool = False
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO cancelled_orders
+            (order_no, submitted_date, cancelled_date, side, order_kind, price, qty, purpose, is_decoy, recorded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            order_no,
+            submitted_date.isoformat(),
+            cancelled_date.isoformat(),
+            side,
+            order_kind,
+            str(price) if price is not None else None,
+            qty,
+            purpose,
+            int(is_decoy),
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+
+def test_get_recent_cancelled_orders_returns_history(conn) -> None:
+    _seed_cancelled_order(
+        conn,
+        "ORD-CANCELLED-1",
+        submitted_date=date(2026, 8, 2),
+        cancelled_date=date(2026, 8, 3),
+        side="SELL",
+        order_kind="LIMIT",
+        price=Decimal("57.50"),
+        qty=75,
+        purpose=th.SELL_TYPE_LIMIT_15PCT,
+    )
+
+    cancelled = get_recent_cancelled_orders(conn)
+    assert len(cancelled) == 1
+    assert cancelled[0]["submitted_date"] == "2026-08-02"
+    assert cancelled[0]["cancelled_date"] == "2026-08-03"
+    assert cancelled[0]["price"] == pytest.approx(57.50)
+    assert cancelled[0]["is_decoy"] is False
+
+
+def test_get_recent_cancelled_orders_respects_limit(conn) -> None:
+    for i in range(5):
+        _seed_cancelled_order(
+            conn,
+            f"ORD-{i}",
+            submitted_date=date(2026, 8, 2),
+            cancelled_date=date(2026, 8, 3),
+            side="BUY",
+            order_kind="LOC",
+            price=Decimal("50.00"),
+            qty=1,
+            purpose=th.BUY_TYPE_FIRST,
+        )
+    assert len(get_recent_cancelled_orders(conn, limit=3)) == 3
+
+
 def test_build_dashboard_payload_assembles_all_sections(conn) -> None:
     bootstrap_new_state(conn, split_count=40, principal=Decimal("10000"), start_date=date(2026, 8, 3))
     th.ensure_portfolio_summary(conn, strategy_start_date=date(2026, 8, 3), initial_principal=Decimal("10000"))
@@ -320,6 +382,7 @@ def test_build_dashboard_payload_assembles_all_sections(conn) -> None:
         "recent_trades",
         "cycle_history",
         "today_orders",
+        "cancelled_orders",
         "generated_at",
     }
     assert payload["portfolio"] is not None
@@ -327,3 +390,4 @@ def test_build_dashboard_payload_assembles_all_sections(conn) -> None:
     assert payload["recent_trades"] == []
     assert payload["cycle_history"] == []
     assert payload["today_orders"] == {"filled": [], "pending": []}
+    assert payload["cancelled_orders"] == []

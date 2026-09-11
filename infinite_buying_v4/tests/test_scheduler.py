@@ -315,6 +315,40 @@ def test_purge_stale_submitted_orders_removes_only_older_rows(conn) -> None:
     assert remaining == {"TODAY1"}
 
 
+def test_purge_stale_submitted_orders_archives_to_cancelled_orders(conn) -> None:
+    """정리되는 주문은 삭제 전에 cancelled_orders에 영구 이력으로 남아야 합니다."""
+    conn.execute(
+        "INSERT INTO submitted_orders (order_no, submitted_date, side, order_kind, price, qty, purpose, is_decoy)"
+        " VALUES ('OLD1', '2026-08-01', 'SELL', 'LIMIT', '57.50', 75, ?, 0)",
+        (SELL_TYPE_LIMIT_15PCT,),
+    )
+
+    scheduler._purge_stale_submitted_orders(conn, before_date=date(2026, 8, 3))
+
+    row = conn.execute("SELECT * FROM cancelled_orders WHERE order_no = 'OLD1'").fetchone()
+    assert row is not None
+    assert row["submitted_date"] == "2026-08-01"
+    assert row["cancelled_date"] == "2026-08-03"
+    assert row["side"] == "SELL"
+    assert row["price"] == "57.50"
+    assert row["qty"] == 75
+    assert row["purpose"] == SELL_TYPE_LIMIT_15PCT
+    assert row["is_decoy"] == 0
+
+
+def test_purge_stale_submitted_orders_does_not_archive_todays_rows(conn) -> None:
+    """오늘 제출된(아직 살아있는) 주문은 cancelled_orders로 옮겨지면 안 됩니다."""
+    conn.execute(
+        "INSERT INTO submitted_orders (order_no, submitted_date, side, order_kind, price, qty, purpose, is_decoy)"
+        " VALUES ('TODAY1', '2026-08-03', 'BUY', 'LOC', '50.00', 10, ?, 0)",
+        (BUY_TYPE_FIRST,),
+    )
+
+    scheduler._purge_stale_submitted_orders(conn, before_date=date(2026, 8, 3))
+
+    assert conn.execute("SELECT COUNT(*) AS c FROM cancelled_orders").fetchone()["c"] == 0
+
+
 def test_stale_orders_do_not_pollute_next_run_fill_ratio(conn) -> None:
     """정리하지 않았다면 발생했을 시나리오를 재현: 어제 취소된 주문이 남아있는 상태에서
     오늘 주문이 100% 체결돼도, 정리를 거치면 어제 주문이 비율 계산에 섞이지 않아야 합니다."""

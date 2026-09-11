@@ -87,9 +87,14 @@
   <div class="note">
     "체결 대기 중"은 오늘 제출됐지만 아직 체결이 확인되지 않은 주문입니다(다음 갱신에서 체결로
     바뀌거나, 장 마감까지 안 되면 미체결로 남습니다). "미끼주문"은 실제 체결 목적이 아니라
-    증권사 주문가 제한을 우회하기 위한 장치입니다. 대기 중이던 주문이 다음 날 이 목록에서
-    조용히 사라졌다면, 체결되지 않고 취소(정리)된 것일 수 있습니다.
+    증권사 주문가 제한을 우회하기 위한 장치입니다. 대기 중이던 주문이 체결되지 않으면 다음날
+    아래 "최근 취소된 주문" 목록으로 옮겨집니다.
   </div>
+</section>
+
+<section id="cancelled-orders-section">
+  <h2>최근 취소된 주문 (최대 20건)</h2>
+  <div id="cancelled-orders-wrap"></div>
 </section>
 
 <section id="trades-section">
@@ -256,6 +261,28 @@ function renderTodayOrders(todayOrders) {
   wrap.innerHTML = html;
 }
 
+function renderCancelledOrders(cancelledOrders) {
+  const wrap = document.getElementById("cancelled-orders-wrap");
+  if (!cancelledOrders || cancelledOrders.length === 0) {
+    wrap.innerHTML = `<div class="empty">취소된 주문 이력이 없습니다.</div>`;
+    return;
+  }
+  const rows = cancelledOrders.map(o => `
+    <tr>
+      <td>${o.submitted_date}</td>
+      <td>${o.cancelled_date}</td>
+      <td class="${o.side === 'BUY' ? 'side-buy' : 'side-sell'}">${o.side === 'BUY' ? '매수' : '매도'}</td>
+      <td>${purposeLabel(o.purpose)}${o.is_decoy ? ' <span class="badge" style="background:rgba(240,184,70,0.15);color:var(--amber);">미끼주문</span>' : ''}</td>
+      <td>${o.order_kind}</td>
+      <td>${o.price !== null ? fmtMoney(o.price) : '시장가'}</td>
+      <td>${o.qty}</td>
+    </tr>`).join("");
+  wrap.innerHTML = `<table>
+    <thead><tr><th>제출일</th><th>취소확인일</th><th>구분</th><th>유형</th><th>주문방식</th><th>주문가</th><th>수량</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
 function renderCycleChart(history) {
   const canvas = document.getElementById("cycle-chart");
   if (!history || history.length === 0) {
@@ -293,6 +320,7 @@ async function refresh() {
     renderSummary(data.portfolio);
     renderCycle(data.cycle);
     renderTodayOrders(data.today_orders);
+    renderCancelledOrders(data.cancelled_orders);
     renderTrades(data.recent_trades);
     renderCycleChart(data.cycle_history);
     document.getElementById("last-updated").textContent =
