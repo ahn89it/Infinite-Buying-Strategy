@@ -15,6 +15,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -320,3 +321,36 @@ def test_settle_day_enters_reverse_mode_when_t_crosses_threshold(conn, config: C
     assert new_state.mode == MODE_REVERSE
     assert new_state.phase is None
     assert new_state.reverse_prev_qty == 110
+
+
+# ---------------------------------------------------------------------------
+# run_dry_run_premarket() — 모의 계좌 요약(dry_run_portfolio_summary) 갱신
+# ---------------------------------------------------------------------------
+
+
+def test_run_dry_run_premarket_refreshes_portfolio_summary_using_latest_close(conn, config: Config) -> None:
+    """대시보드 "DRY-RUN 모의 계좌" 요약 카드가 읽는 dry_run_portfolio_summary가,
+    run_dry_run_premarket() 한 번 호출로 정산 결과를 반영해 갱신되는지 검증합니다.
+    현재가로는 조회된 일봉 중 가장 최신(마지막) 종가를 씁니다."""
+    from infinite_buying_v4.dashboard.data import get_dry_run_portfolio_summary
+
+    sim.ensure_dry_run_state(conn, config, start_date=date(2026, 8, 3))
+    conn.execute(
+        "INSERT INTO dry_run_orders (submitted_date, side, order_kind, price, qty, purpose, is_decoy) VALUES (?,?,?,?,?,?,?)",
+        ("2026-08-03", "BUY", "LOC", "50.00", 10, BUY_TYPE_FIRST, 0),
+    )
+    # 8/3 종가 49(매수 체결가), 8/4가 가장 최신 바 -> 미실현손익 계산의 현재가로 51이 쓰여야 함
+    fake_ohlc = [
+        _ohlc(date(2026, 8, 3), o="49.50", h="50.50", l="48.50", c="49.00"),
+        _ohlc(date(2026, 8, 4), o="49.50", h="51.50", l="49.00", c="51.00"),
+    ]
+
+    with patch("infinite_buying_v4.dry_run_simulator.get_recent_daily_ohlc", return_value=fake_ohlc):
+        sim.run_dry_run_premarket(conn, config, date(2026, 8, 4))
+
+    summary = get_dry_run_portfolio_summary(conn)
+    assert summary is not None
+    # 10주를 49.00에 매수, 현재가(가장 최신 종가) 51.00 -> 미실현손익 = (51-49)*10 = 20
+    assert summary["current_unrealized_pnl"] == 20.0
+    principal = float(config.principal)
+    assert summary["total_equity"] == principal - 490.0 + 51.0 * 10  # 잔금 + 평가금액

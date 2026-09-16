@@ -259,6 +259,26 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         duration_days INTEGER
     )
     """,
+    # dry_run_portfolio_summary: portfolio_summary의 모의 버전 (2026-09-16 추가).
+    # 실제 계좌는 scheduler.py가 실시간 시세(get_quote)로 매번 갱신하지만, 모의 계좌는
+    # 실시간 시세가 없으므로 매 프리장 실행 시점에 조회한 "가장 최근 일봉 종가"를
+    # current_price로 삼아 갱신합니다(dry_run_simulator.run_dry_run_premarket 참고) —
+    # 그래서 장중 실시간 값이 아니라 최대 하루 전 종가 기준 스냅샷입니다.
+    """
+    CREATE TABLE IF NOT EXISTS dry_run_portfolio_summary (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        strategy_start_date TEXT NOT NULL,
+        initial_principal TEXT NOT NULL,
+        total_realized_profit TEXT NOT NULL DEFAULT '0',
+        total_realized_return_pct TEXT NOT NULL DEFAULT '0',
+        current_unrealized_pnl TEXT NOT NULL DEFAULT '0',
+        current_unrealized_return_pct TEXT NOT NULL DEFAULT '0',
+        total_equity TEXT NOT NULL,
+        total_return_pct TEXT NOT NULL DEFAULT '0',
+        completed_cycles INTEGER NOT NULL DEFAULT 0,
+        last_updated TEXT NOT NULL
+    )
+    """,
     # 조회 성능을 위한 인덱스. cycle_id로 거래 이력을 자주 조회하므로(대시보드 등) 추가합니다.
     "CREATE INDEX IF NOT EXISTS idx_buy_records_cycle_id ON buy_records (cycle_id)",
     "CREATE INDEX IF NOT EXISTS idx_sell_records_cycle_id ON sell_records (cycle_id)",

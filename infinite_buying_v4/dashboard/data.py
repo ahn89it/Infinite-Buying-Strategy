@@ -320,9 +320,9 @@ def get_dry_run_status(conn: sqlite3.Connection, *, today: date) -> dict[str, An
     한 번도 프리장/본장이 돌지 않아 dry_run_state가 없으면 None을 반환합니다 — 이 경우
     화면에서는 "아직 시뮬레이션 데이터 없음"으로 처리하면 됩니다.
 
-    portfolio_summary 같은 미실현손익 스냅샷은 모의 계좌에는 없습니다(실제 매매만
-    scheduler.py가 시세 조회 시점에 갱신하므로) — 대신 현재가 없이 avg_price/holding_qty만
-    보여주고, 손익은 cycle_history(완료된 모의 사이클의 cycle_return_pct)로 확인합니다.
+    총평가금액/총수익률처럼 계좌 전체를 아우르는 값은 여기가 아니라
+    get_dry_run_portfolio_summary()가 담당합니다(get_portfolio_summary()와
+    get_current_cycle_status()가 분리된 것과 같은 구조).
     """
     try:
         s = dry_run_simulator.load_dry_run_state(conn)
@@ -341,6 +341,33 @@ def get_dry_run_status(conn: sqlite3.Connection, *, today: date) -> dict[str, An
         "holding_qty": s.holding_qty,
         "remaining_cash": _to_float(s.remaining_cash),
         "reverse_day_count": s.reverse_day_count if s.mode == MODE_REVERSE else None,
+    }
+
+
+def get_dry_run_portfolio_summary(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    """DRY_RUN 모의 계좌의 총평가금액/총수익률 등 요약 (get_portfolio_summary()의 dry_run_* 버전).
+
+    `dry_run_portfolio_summary`는 dry_run_simulator.run_dry_run_premarket()이 매 프리장
+    실행 시점마다 "가장 최근 일봉 종가"를 현재가로 삼아 갱신합니다. 실제 계좌의
+    portfolio_summary는 get_quote()의 근실시간 시세를 쓰지만, 모의 계좌는 실시간 시세가
+    없으므로 **최대 하루 전 종가 기준 스냅샷**입니다 — 화면에도 이 사실을 표시합니다.
+
+    아직 한 번도 프리장이 돌지 않아 행이 없으면 None을 반환합니다.
+    """
+    row = conn.execute("SELECT * FROM dry_run_portfolio_summary WHERE id = 1").fetchone()
+    if row is None:
+        return None
+    return {
+        "strategy_start_date": row["strategy_start_date"],
+        "initial_principal": _to_float(Decimal(row["initial_principal"])),
+        "total_realized_profit": _to_float(Decimal(row["total_realized_profit"])),
+        "total_realized_return_pct": _to_float(Decimal(row["total_realized_return_pct"])),
+        "current_unrealized_pnl": _to_float(Decimal(row["current_unrealized_pnl"])),
+        "current_unrealized_return_pct": _to_float(Decimal(row["current_unrealized_return_pct"])),
+        "total_equity": _to_float(Decimal(row["total_equity"])),
+        "total_return_pct": _to_float(Decimal(row["total_return_pct"])),
+        "completed_cycles": row["completed_cycles"],
+        "last_updated": row["last_updated"],
     }
 
 
@@ -443,6 +470,7 @@ def build_dashboard_payload(conn: sqlite3.Connection, *, today: date, dry_run_en
         "cancelled_orders": get_recent_cancelled_orders(conn),
         "dry_run": (
             {
+                "portfolio": get_dry_run_portfolio_summary(conn),
                 "status": get_dry_run_status(conn, today=today),
                 "recent_trades": get_dry_run_recent_trades(conn),
                 "cycle_history": get_dry_run_cycle_history(conn),

@@ -72,6 +72,7 @@ _STATE_TABLE = "dry_run_state"
 _BUY_TABLE = "dry_run_buy_records"
 _SELL_TABLE = "dry_run_sell_records"
 _CYCLE_TABLE = "dry_run_cycle_summary"
+_PORTFOLIO_TABLE = "dry_run_portfolio_summary"
 
 _BUY_ROUND_PURPOSES = (BUY_TYPE_FIRST, BUY_TYPE_HALF_STAR, BUY_TYPE_HALF_AVG, BUY_TYPE_FULL_STAR)
 _FULL_FILL_RATIO_THRESHOLD = Decimal("0.99")
@@ -205,6 +206,9 @@ def ensure_dry_run_state(conn: sqlite3.Connection, config: Config, *, start_date
         conn, split_count=config.split_count, principal=config.principal, start_date=start_date, table=_STATE_TABLE
     )
     trade_history.open_cycle_summary(conn, cycle_id=state.cycle_id, start_date=start_date, table=_CYCLE_TABLE)
+    trade_history.ensure_portfolio_summary(
+        conn, strategy_start_date=start_date, initial_principal=config.principal, table=_PORTFOLIO_TABLE
+    )
     logger.info(
         "[DRY-RUN 시뮬레이션] 모의 계좌 신규 생성: split_count=%d, principal=%s, start_date=%s",
         state.split_count,
@@ -268,6 +272,35 @@ def run_dry_run_premarket(conn: sqlite3.Connection, config: Config, today: date)
         state = _settle_day(conn, config, state, target_date, ohlc)
 
     save_state(conn, state, table=_STATE_TABLE)
+    _refresh_dry_run_portfolio_summary(conn, config, state, latest_close=ohlc_bars[-1].close)
+
+
+def _refresh_dry_run_portfolio_summary(conn: sqlite3.Connection, config: Config, state: State, *, latest_close: Decimal) -> None:
+    """모의 계좌의 총평가금액/총수익률 등을 재계산합니다 (real state의 portfolio_summary에
+    대응, 1-12절/대시보드 "DRY-RUN 모의 계좌" 요약 카드가 이 값을 읽습니다).
+
+    real 경로(scheduler.run_premarket_update)는 get_quote()로 근실시간 현재가를 쓰지만,
+    모의 계좌는 실시간 시세가 없으므로 이번 프리장 시점에 조회한 **가장 최근 일봉 종가**를
+    현재가로 씁니다 — 최대 하루 전 종가 기준 스냅샷이라는 뜻이며, 대시보드 쪽 안내 문구에도
+    이 사실을 표기합니다.
+
+    `ensure_portfolio_summary()`는 `ensure_dry_run_state()`가 모의 계좌를 처음 만들 때
+    이미 호출해두지만, 이 기능(2026-09-16 추가) 이전부터 DRY_RUN을 돌려온 DB는
+    `dry_run_state`는 있어도 `dry_run_portfolio_summary` 행이 없을 수 있습니다 — 그런
+    경우를 대비해 없으면 여기서 한 번 더 만들어줍니다(멱등이라 이미 있으면 아무 일도 안 함).
+    """
+    trade_history.ensure_portfolio_summary(
+        conn, strategy_start_date=state.cycle_start_date, initial_principal=config.principal, table=_PORTFOLIO_TABLE
+    )
+    trade_history.update_portfolio_summary(
+        conn,
+        current_price=latest_close,
+        remaining_cash=state.remaining_cash,
+        avg_price=state.avg_price,
+        holding_qty=state.holding_qty,
+        table=_PORTFOLIO_TABLE,
+        cycle_table=_CYCLE_TABLE,
+    )
 
 
 def _settle_day(conn: sqlite3.Connection, config: Config, state: State, target_date: date, ohlc: DailyOHLC) -> State:

@@ -432,18 +432,53 @@ def test_build_dashboard_payload_dry_run_enabled_includes_shadow_status(conn) ->
     payload = build_dashboard_payload(conn, today=date(2026, 8, 3), dry_run_enabled=True)
 
     assert payload["dry_run"] is not None
-    assert set(payload["dry_run"].keys()) == {"status", "recent_trades", "cycle_history", "pending_orders"}
+    assert set(payload["dry_run"].keys()) == {"portfolio", "status", "recent_trades", "cycle_history", "pending_orders"}
     assert payload["dry_run"]["status"]["mode"] == MODE_NORMAL
     assert payload["dry_run"]["status"]["holding_qty"] == 0
     assert payload["dry_run"]["recent_trades"] == []
     assert payload["dry_run"]["cycle_history"] == []
     assert payload["dry_run"]["pending_orders"] == []
+    # ensure_dry_run_state()가 모의 계좌를 만들 때 함께 부트스트랩하므로 이미 존재해야 합니다.
+    assert payload["dry_run"]["portfolio"] is not None
+    assert payload["dry_run"]["portfolio"]["initial_principal"] == 10000.0
+    assert payload["dry_run"]["portfolio"]["completed_cycles"] == 0
 
 
 def test_get_dry_run_status_returns_none_before_any_simulation(conn) -> None:
     from infinite_buying_v4.dashboard.data import get_dry_run_status
 
     assert get_dry_run_status(conn, today=date(2026, 8, 3)) is None
+
+
+def test_get_dry_run_portfolio_summary_returns_none_before_any_simulation(conn) -> None:
+    from infinite_buying_v4.dashboard.data import get_dry_run_portfolio_summary
+
+    assert get_dry_run_portfolio_summary(conn) is None
+
+
+def test_get_dry_run_portfolio_summary_reflects_bootstrap(conn) -> None:
+    """ensure_dry_run_state()가 모의 계좌를 처음 만드는 시점에 dry_run_portfolio_summary도
+    함께 초기화되므로, 매수/매도 체결이 아직 없어도(원금 그대로) 조회가 가능해야 합니다."""
+    from infinite_buying_v4 import dry_run_simulator as sim
+    from infinite_buying_v4.config import Config
+    from infinite_buying_v4.dashboard.data import get_dry_run_portfolio_summary
+
+    config = Config(
+        app_key="k", app_secret="s", api_base_url="https://x", ws_base_url="wss://x",
+        ticker="TQQQ", exchange_code="ND", split_count=40, principal=Decimal("10000"),
+        compound_on_restart=True, db_path=Path("unused.db"), event_log_path=Path("unused.jsonl"),
+        dashboard_port=8000, dry_run=True,
+    )
+    sim.ensure_dry_run_state(conn, config, start_date=date(2026, 8, 3))
+
+    summary = get_dry_run_portfolio_summary(conn)
+
+    assert summary is not None
+    assert summary["strategy_start_date"] == "2026-08-03"
+    assert summary["initial_principal"] == 10000.0
+    assert summary["total_equity"] == 10000.0
+    assert summary["total_return_pct"] == 0.0
+    assert summary["completed_cycles"] == 0
 
 
 def test_get_dry_run_pending_orders_reflects_dry_run_orders_table(conn) -> None:

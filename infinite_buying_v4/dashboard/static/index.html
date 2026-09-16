@@ -118,6 +118,7 @@
     실제 돈과는 무관합니다. 정규장 종가 기준 근사이므로 프리/애프터마켓 가격 변동은
     반영하지 않습니다.
   </div>
+  <div class="grid" id="dry-run-summary-cards"></div>
   <div class="grid" id="dry-run-cards" style="margin-top:14px;"></div>
   <div style="margin-top:18px;">
     <div class="sub" style="margin-bottom:6px;">체결 판정 대기 중인 모의 주문</div>
@@ -346,6 +347,25 @@ function renderCycleChart(history) {
 // --- DRY-RUN 모의 계좌(shadow state) 렌더링 -------------------------------
 // data.dry_run이 null이면(=config.dry_run이 False, 즉 실투자 모드) 섹션 자체를 숨깁니다.
 
+function renderDryRunPortfolioSummary(portfolio) {
+  const el = document.getElementById("dry-run-summary-cards");
+  if (!portfolio) {
+    el.innerHTML = "";
+    return;
+  }
+  el.innerHTML = [
+    card("총평가금액 (모의)", fmtMoney(portfolio.total_equity),
+      `원금 ${fmtMoney(portfolio.initial_principal)} 대비`),
+    card("총수익률 (모의, 실현+미실현)", fmtPct(portfolio.total_return_pct), null, pctClass(portfolio.total_return_pct)),
+    card("실현 수익금 (모의)", fmtMoney(portfolio.total_realized_profit),
+      fmtPct(portfolio.total_realized_return_pct), pctClass(portfolio.total_realized_return_pct)),
+    card("평가(미실현) 손익 (모의)", fmtMoney(portfolio.current_unrealized_pnl),
+      fmtPct(portfolio.current_unrealized_return_pct), pctClass(portfolio.current_unrealized_return_pct)),
+    card("완료된 모의 사이클", `${portfolio.completed_cycles}회`, `전략 시작일 ${portfolio.strategy_start_date}`),
+  ].join("") + `<div class="note" style="grid-column:1/-1;">최근 갱신: ${new Date(portfolio.last_updated).toLocaleString("ko-KR")}
+    — 실시간 시세가 아니라 가장 최근 일봉 종가 기준 스냅샷입니다(프리장 실행 시점마다 갱신).</div>`;
+}
+
 function renderDryRunStatus(status) {
   const el = document.getElementById("dry-run-cards");
   if (!status) {
@@ -392,6 +412,7 @@ function renderDryRunSection(dryRun) {
     return;
   }
   section.hidden = false;
+  renderDryRunPortfolioSummary(dryRun.portfolio);
   renderDryRunStatus(dryRun.status);
   renderDryRunPendingOrders(dryRun.pending_orders);
   renderTrades(dryRun.recent_trades, "dry-run-trades-wrap");

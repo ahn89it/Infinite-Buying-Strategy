@@ -262,26 +262,30 @@ def _sum_decimal_column(conn: sqlite3.Connection, table: str, column: str, cycle
 
 
 def ensure_portfolio_summary(
-    conn: sqlite3.Connection, *, strategy_start_date: date, initial_principal: Decimal
+    conn: sqlite3.Connection, *, strategy_start_date: date, initial_principal: Decimal, table: str = "portfolio_summary"
 ) -> None:
     """portfolio_summary(설계도 9-4번) 싱글턴 행을 최초 1회 생성합니다.
 
     이미 존재하면 아무 것도 하지 않습니다(멱등). strategy_start_date/initial_principal은
     전략을 처음 시작한 시점에 딱 한 번 고정되는 값이므로, 이후 update_portfolio_summary()는
     이 값들을 다시 받지 않고 DB에 저장된 값을 그대로 재사용합니다.
+
+    `table`: 기본은 실제 `portfolio_summary`이지만, DRY_RUN 시뮬레이션이 이 검증된 집계
+    로직을 그대로 재사용할 수 있도록 스키마가 동일한 `dry_run_portfolio_summary`도
+    지정할 수 있습니다(dry_run_simulator.py 참고). 항상 코드 내부 상수만 들어옵니다.
     """
-    row = conn.execute("SELECT 1 FROM portfolio_summary WHERE id = 1").fetchone()
+    row = conn.execute(f"SELECT 1 FROM {table} WHERE id = 1").fetchone()  # noqa: S608
     if row is not None:
         return
     now_iso = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        """
-        INSERT INTO portfolio_summary (
+        f"""
+        INSERT INTO {table} (
             id, strategy_start_date, initial_principal, total_realized_profit,
             total_realized_return_pct, current_unrealized_pnl, current_unrealized_return_pct,
             total_equity, total_return_pct, completed_cycles, last_updated
         ) VALUES (1, ?, ?, '0', '0', '0', '0', ?, '0', 0, ?)
-        """,
+        """,  # noqa: S608
         (strategy_start_date.isoformat(), str(initial_principal), str(initial_principal), now_iso),
     )
 
@@ -293,20 +297,25 @@ def update_portfolio_summary(
     remaining_cash: Decimal,
     avg_price: Decimal,
     holding_qty: int,
+    table: str = "portfolio_summary",
+    cycle_table: str = "cycle_summary",
 ) -> None:
     """계좌 전체 누적 성과를 재계산합니다 (설계도 9-4번).
 
     매수/매도 체결이 있을 때마다, 그리고 매일 장 마감 후 시세 갱신 시점에 호출해야 합니다.
     ensure_portfolio_summary()가 먼저 호출되어 행이 존재해야 합니다.
+
+    `table`/`cycle_table` 설명은 ensure_portfolio_summary()/record_buy() 참고 — DRY_RUN
+    시뮬레이션은 `dry_run_portfolio_summary`/`dry_run_cycle_summary` 조합으로 호출합니다.
     """
-    row = conn.execute("SELECT * FROM portfolio_summary WHERE id = 1").fetchone()
+    row = conn.execute(f"SELECT * FROM {table} WHERE id = 1").fetchone()  # noqa: S608
     if row is None:
-        raise TradeHistoryError("portfolio_summary 행이 없습니다. ensure_portfolio_summary()를 먼저 호출하세요.")
+        raise TradeHistoryError(f"{table} 행이 없습니다. ensure_portfolio_summary()를 먼저 호출하세요.")
 
     initial_principal = Decimal(row["initial_principal"])
 
     completed_row = conn.execute(
-        "SELECT cycle_profit_amount FROM cycle_summary WHERE end_date IS NOT NULL"
+        f"SELECT cycle_profit_amount FROM {cycle_table} WHERE end_date IS NOT NULL"  # noqa: S608
     ).fetchall()
     total_realized_profit = sum((Decimal(r["cycle_profit_amount"]) for r in completed_row), Decimal(0))
     total_realized_return_pct = (
@@ -326,17 +335,17 @@ def update_portfolio_summary(
     )
 
     completed_cycles = conn.execute(
-        "SELECT COUNT(*) AS cnt FROM cycle_summary WHERE end_date IS NOT NULL"
+        f"SELECT COUNT(*) AS cnt FROM {cycle_table} WHERE end_date IS NOT NULL"  # noqa: S608
     ).fetchone()["cnt"]
 
     conn.execute(
-        """
-        UPDATE portfolio_summary
+        f"""
+        UPDATE {table}
         SET total_realized_profit = ?, total_realized_return_pct = ?,
             current_unrealized_pnl = ?, current_unrealized_return_pct = ?,
             total_equity = ?, total_return_pct = ?, completed_cycles = ?, last_updated = ?
         WHERE id = 1
-        """,
+        """,  # noqa: S608
         (
             str(total_realized_profit),
             str(total_realized_return_pct),
