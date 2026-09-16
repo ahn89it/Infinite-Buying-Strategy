@@ -592,7 +592,7 @@ def _generate_reverse_mode_orders(config: Config, state: State) -> list[OrderInt
 # ---------------------------------------------------------------------------
 
 
-def _run_guarded(run_type: str, fn, config: Config, conn: sqlite3.Connection, notifier: NotifierBase) -> None:
+def _run_guarded(run_type: str, fn, config: Config, notifier: NotifierBase) -> None:
     """작업 실행을 감싸서, 처리되지 않은 예외(StateError/FormulaError/NormalModeError/
     KiwoomAdapterError 등 무엇이든)가 나면 CRITICAL 알림을 보내고 다시 발생시킵니다
     (설계도 11번 "자동매매 중단 + 알림"의 실제 트리거 지점입니다).
@@ -602,7 +602,17 @@ def _run_guarded(run_type: str, fn, config: Config, conn: sqlite3.Connection, no
     자동으로 재시도"하지 않는 이유: 이 예외들은 대부분 일시적 네트워크 문제가 아니라
     상태/로직 불일치를 의미하므로, 원인 파악 전에 자동으로 계속 도는 것이 더 위험합니다.
     복구 절차는 운영 런북 문서의 "장애 복구 런북" 섹션을 참고하세요.
+
+    SQLite 커넥션은 여기서 매번 새로 엽니다(끝나면 반드시 닫음). APScheduler의
+    BlockingScheduler는 등록된 작업을 "스케줄러를 시작한 스레드"가 아니라 내부
+    스레드풀(executor)의 별도 작업자 스레드에서 실행합니다. 커넥션을 start_scheduler()
+    쪽에서 한 번만 만들어 클로저로 넘기면, 그 커넥션을 만든 스레드와 실제로 사용하는
+    스레드가 달라져 `sqlite3.ProgrammingError: SQLite objects created in a thread can
+    only be used in that same thread`가 매 실행마다 발생합니다(실제로 2026-09-11 이후
+    모든 프리장/본장 실행이 이 오류로 실패했던 원인). 매번 새로 여는 방식은
+    dashboard/server.py가 요청마다 새 커넥션을 여는 것과 동일한 이유·동일한 해법입니다.
     """
+    conn = db.get_connection(config.db_path)
     try:
         fn(config, conn, notifier)
     except Exception as exc:
@@ -612,6 +622,8 @@ def _run_guarded(run_type: str, fn, config: Config, conn: sqlite3.Connection, no
             f"{type(exc).__name__}: {exc}\n\n조치 방법은 운영 런북의 '장애 복구' 절차를 참고하세요.",
         )
         raise
+    finally:
+        conn.close()
 
 
 def start_scheduler(config: Config | None = None, notifier: NotifierBase | None = None):
@@ -639,7 +651,11 @@ def start_scheduler(config: Config | None = None, notifier: NotifierBase | None 
     notifier = notifier or LogNotifier()
     try:
         config = config or load_config()
-        conn = db.get_connection(config.db_path)
+        # 시작 시점에 DB 경로/스키마가 정상인지만 미리 확인하고 바로 닫습니다. 이 커넥션을
+        # 계속 들고 있다가 아래 작업(job)에 넘기면 안 됩니다 — 작업은 이 함수를 호출한
+        # 스레드가 아니라 APScheduler의 별도 작업자 스레드에서 실행되는데, SQLite
+        # 커넥션은 그것을 만든 스레드에서만 쓸 수 있기 때문입니다(_run_guarded 참고).
+        db.get_connection(config.db_path).close()
     except Exception as exc:
         logger.exception("설정/DB 초기화 실패로 스케줄러를 시작할 수 없습니다.")
         notifier.notify_critical("설정/DB 초기화 실패 - 스케줄러 시작 불가", f"{type(exc).__name__}: {exc}")
@@ -656,14 +672,14 @@ def start_scheduler(config: Config | None = None, notifier: NotifierBase | None 
     scheduler.add_listener(_on_job_error, EVENT_JOB_ERROR)
 
     scheduler.add_job(
-        lambda: _run_guarded("PREMARKET", run_premarket_update, config, conn, notifier),
+        lambda: _run_guarded("PREMARKET", run_premarket_update, config, notifier),
         trigger=CronTrigger(
             day_of_week="mon-fri", hour=PREMARKET_START.hour, minute=PREMARKET_START.minute, timezone=MARKET_TZ
         ),
         id="premarket_update",
     )
     scheduler.add_job(
-        lambda: _run_guarded("REGULAR", run_regular_session_orders, config, conn, notifier),
+        lambda: _run_guarded("REGULAR", run_regular_session_orders, config, notifier),
         trigger=CronTrigger(
             day_of_week="mon-fri", hour=REGULAR_START.hour, minute=REGULAR_START.minute, timezone=MARKET_TZ
         ),

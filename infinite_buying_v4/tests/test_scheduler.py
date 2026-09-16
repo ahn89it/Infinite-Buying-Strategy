@@ -84,6 +84,72 @@ def config(tmp_path: Path) -> Config:
 
 
 # ---------------------------------------------------------------------------
+# _run_guarded (스레드 간 SQLite 커넥션 안전성 - 실제 운영 버그 재현/회귀 테스트)
+# ---------------------------------------------------------------------------
+
+
+def test_run_guarded_opens_its_own_connection_in_the_calling_thread(config: Config) -> None:
+    """실제 재현된 버그: APScheduler의 BlockingScheduler는 등록한 작업을 스케줄러를
+    시작한 스레드가 아니라 내부 스레드풀의 별도 작업자 스레드에서 실행합니다. 예전
+    구현은 start_scheduler()가 커넥션을 한 번만 만들어 클로저로 넘겼는데, 그 커넥션을
+    만든 스레드와 실제로 쿼리를 실행하는 스레드가 달라서 매 실행마다
+    `sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in
+    that same thread`로 실패했습니다(2026-09-11부터 실제 운영 로그에서 확인됨 —
+    프리장/본장 작업이 단 한 번도 성공하지 못하고 매번 스케줄러가 종료됐음).
+
+    이 테스트는 _run_guarded를 메인 스레드가 아닌 별도 스레드에서 호출해, 그 안에서
+    SQLite 쿼리가 예외 없이 실행되는지 검증합니다 — _run_guarded가 항상 "자신을 호출한
+    스레드 안에서" 새 커넥션을 여는 한(그리고 그 커넥션을 다른 스레드로 넘기지 않는 한)
+    이 테스트는 어떤 스레드에서 호출돼도 통과해야 합니다.
+    """
+    import threading
+
+    # 스키마가 미리 존재해야 하므로 한 번 열어서 만들어둡니다(이 커넥션은 메인 스레드
+    # 것이라 바로 닫고, _run_guarded가 워커 스레드 안에서 별도로 새로 엽니다).
+    db.get_connection(config.db_path).close()
+
+    executed_thread_ids: list[int] = []
+    errors: list[BaseException] = []
+
+    def fake_fn(cfg: Config, conn, notifier: NotifierBase) -> None:
+        # conn이 "지금 이 스레드"에서 실제로 동작하는지 쿼리를 날려 확인합니다.
+        conn.execute("SELECT 1").fetchone()
+        executed_thread_ids.append(threading.get_ident())
+
+    def worker() -> None:
+        try:
+            scheduler._run_guarded("PREMARKET", fake_fn, config, _RecordingNotifier())
+        except BaseException as exc:  # noqa: BLE001 - 테스트에서 스레드 예외를 회수하기 위함
+            errors.append(exc)
+
+    main_thread_id = threading.get_ident()
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive(), "워커 스레드가 제한 시간 내에 끝나지 않았습니다."
+    assert errors == [], f"워커 스레드에서 예외 발생: {errors}"
+    assert executed_thread_ids == [thread.ident]
+    assert executed_thread_ids[0] != main_thread_id  # 실제로 다른 스레드에서 실행됐는지 확인
+
+
+def test_run_guarded_closes_connection_even_on_failure(config: Config) -> None:
+    """fn이 예외를 던져도 _run_guarded가 연 커넥션은 finally에서 닫혀야 합니다
+    (열어둔 채로 예외만 다시 던지면 커넥션이 누수됩니다)."""
+
+    def failing_fn(cfg: Config, conn, notifier: NotifierBase) -> None:
+        raise RuntimeError("의도적 실패")
+
+    with pytest.raises(RuntimeError):
+        scheduler._run_guarded("PREMARKET", failing_fn, config, _RecordingNotifier())
+
+    # 커넥션이 제대로 닫혔다면, 같은 파일로 새 커넥션을 여는 데 문제가 없어야 합니다.
+    conn = db.get_connection(config.db_path)
+    conn.execute("SELECT 1").fetchone()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
 # _claim_daily_run (멱등성)
 # ---------------------------------------------------------------------------
 
