@@ -42,6 +42,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 from typing import Any, Awaitable, Callable, Literal
 
@@ -347,6 +348,65 @@ def get_recent_daily_closes(config: Config, *, count: int = 5) -> list[Decimal]:
             f"직전 {count}거래일 종가를 조회하는 데 필요한 데이터가 부족합니다 (조회된 일수: {len(parsed)})."
         )
     return [price for _, price in parsed[-count:]]
+
+
+@dataclass(frozen=True)
+class DailyOHLC:
+    """하루치 시가/고가/저가/종가. DRY_RUN 체결 시뮬레이션(dry_run_simulator.py)이
+    "그날 실제 가격이었다면 주문이 체결됐을지"를 판정하는 데 씁니다.
+    """
+
+    trade_date: date
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+
+
+def get_recent_daily_ohlc(config: Config, *, count: int = 5) -> list[DailyOHLC]:
+    """직전 count 거래일의 시가/고가/저가/종가를 "오래된 날짜 -> 최신 날짜" 순서로
+    반환합니다. `get_recent_daily_closes()`와 같은 일봉 차트 API를 쓰되, 종가 외에
+    고가/저가/시가까지 함께 돌려줍니다 — DRY_RUN 모드에서 LOC/MOC/지정가 주문이
+    "그날 실제로 체결됐을지"를 시뮬레이션하려면 종가뿐 아니라 고가/저가(장중에 지정가를
+    스쳤는지)도 필요하기 때문입니다.
+
+    주의: 이 일봉 데이터는 정규장(본장) 기준입니다. 프리마켓/애프터마켓 중 형성된
+    가격은 포함하지 않으므로, 지정가매도(프리~애프터 전체 유지)의 시뮬레이션은
+    "정규장 중에만 스쳤는지"로 근사한 것이며 실제와 다를 수 있습니다.
+    """
+    lookback_start = (now_et_date_minus_calendar_days(20)).strftime("%Y%m%d")
+    body = {
+        "stex_tp": config.exchange_code,
+        "stk_cd": config.ticker,
+        "strt_dt": lookback_start,
+        "upd_stkpc_tp": "1",
+        "exrt_appl_tp": "0",
+    }
+    try:
+        response = _client().fetch_page(api_id=_DAILY_CHART_API_ID, path=_CHART_PATH, body=body)
+    except KiwoomError as exc:
+        raise KiwoomAdapterError(f"일봉 차트(OHLC) 조회 실패: {exc}") from exc
+
+    rows = response.body.get("result_list") or []
+    parsed = sorted(
+        (
+            DailyOHLC(
+                trade_date=date(int(str(row["dt"])[:4]), int(str(row["dt"])[4:6]), int(str(row["dt"])[6:8])),
+                open=Decimal(str(row.get("open_pric") or "0")),
+                high=Decimal(str(row.get("high_pric") or "0")),
+                low=Decimal(str(row.get("low_pric") or "0")),
+                close=Decimal(str(row.get("cur_prc") or "0")),
+            )
+            for row in rows
+            if row.get("dt")
+        ),
+        key=lambda bar: bar.trade_date,
+    )
+    if len(parsed) < count:
+        raise KiwoomAdapterError(
+            f"직전 {count}거래일 OHLC를 조회하는 데 필요한 데이터가 부족합니다 (조회된 일수: {len(parsed)})."
+        )
+    return parsed[-count:]
 
 
 def now_et_date_minus_calendar_days(days: int):

@@ -25,6 +25,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+from infinite_buying_v4 import dry_run_simulator
 from infinite_buying_v4.formulas import buy_trigger_price, sell_trigger_price
 from infinite_buying_v4.state import MODE_NORMAL, MODE_REVERSE, PHASE_FIRST, StateError, load_state
 
@@ -305,11 +306,133 @@ def get_recent_cancelled_orders(conn: sqlite3.Connection, *, limit: int = _RECEN
     ]
 
 
-def build_dashboard_payload(conn: sqlite3.Connection, *, today: date) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# DRY_RUN 모의 계좌(shadow state) 조회 — dry_run_simulator.py가 진행시킨 값
+# ---------------------------------------------------------------------------
+
+
+def get_dry_run_status(conn: sqlite3.Connection, *, today: date) -> dict[str, Any] | None:
+    """DRY_RUN 모의 계좌 현황 (실투자 전환 전 검증용, 설계도 범위 밖 이 프로젝트의 추가 기능).
+
+    실제 `state`는 DRY_RUN 중 절대 전진하지 않으므로(주문이 진짜로 체결될 일이 없어
+    T=0/holding_qty=0에 멈춰 있음), 이 함수는 그 대신 dry_run_simulator.py가 실제 시세로
+    "체결됐을 것"이라 판정하며 진행시킨 모의 계좌(dry_run_state)를 보여줍니다. 아직
+    한 번도 프리장/본장이 돌지 않아 dry_run_state가 없으면 None을 반환합니다 — 이 경우
+    화면에서는 "아직 시뮬레이션 데이터 없음"으로 처리하면 됩니다.
+
+    portfolio_summary 같은 미실현손익 스냅샷은 모의 계좌에는 없습니다(실제 매매만
+    scheduler.py가 시세 조회 시점에 갱신하므로) — 대신 현재가 없이 avg_price/holding_qty만
+    보여주고, 손익은 cycle_history(완료된 모의 사이클의 cycle_return_pct)로 확인합니다.
+    """
+    try:
+        s = dry_run_simulator.load_dry_run_state(conn)
+    except StateError:
+        return None
+
+    return {
+        "cycle_id": s.cycle_id,
+        "mode": s.mode,
+        "phase": s.phase,
+        "start_date": s.cycle_start_date.isoformat(),
+        "elapsed_days": (today - s.cycle_start_date).days,
+        "t": _to_float(s.t),
+        "split_count": s.split_count,
+        "avg_price": _to_float(s.avg_price) if s.holding_qty > 0 else None,
+        "holding_qty": s.holding_qty,
+        "remaining_cash": _to_float(s.remaining_cash),
+        "reverse_day_count": s.reverse_day_count if s.mode == MODE_REVERSE else None,
+    }
+
+
+def get_dry_run_recent_trades(conn: sqlite3.Connection, *, limit: int = _RECENT_TRADES_LIMIT) -> list[dict[str, Any]]:
+    """모의 계좌의 최근 매수/매도 기록 (get_recent_trades()의 dry_run_* 버전)."""
+    rows = conn.execute(
+        """
+        SELECT * FROM (
+            SELECT buy_date AS trade_date, 'BUY' AS side, buy_price AS price, buy_qty AS qty,
+                   order_type, NULL AS profit_amount, NULL AS return_pct, created_at
+            FROM dry_run_buy_records
+            UNION ALL
+            SELECT sell_date AS trade_date, 'SELL' AS side, sell_price AS price, sell_qty AS qty,
+                   order_type, profit_amount, return_pct, created_at
+            FROM dry_run_sell_records
+        )
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+    return [
+        {
+            "date": row["trade_date"],
+            "side": row["side"],
+            "price": _to_float(Decimal(row["price"])),
+            "qty": row["qty"],
+            "order_type": row["order_type"],
+            "profit_amount": _to_float(Decimal(row["profit_amount"])) if row["profit_amount"] is not None else None,
+            "return_pct": _to_float(Decimal(row["return_pct"])) if row["return_pct"] is not None else None,
+        }
+        for row in rows
+    ]
+
+
+def get_dry_run_cycle_history(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """모의 계좌의 완료된 사이클 히스토리 (get_cycle_history()의 dry_run_* 버전)."""
+    rows = conn.execute(
+        """
+        SELECT cycle_id, start_date, end_date, cycle_return_pct, cycle_profit_amount, hit_reverse_mode
+        FROM dry_run_cycle_summary
+        WHERE end_date IS NOT NULL
+        ORDER BY cycle_id ASC
+        """
+    ).fetchall()
+
+    return [
+        {
+            "cycle_id": row["cycle_id"],
+            "start_date": row["start_date"],
+            "end_date": row["end_date"],
+            "cycle_return_pct": _to_float(Decimal(row["cycle_return_pct"])) if row["cycle_return_pct"] is not None else None,
+            "cycle_profit_amount": (
+                _to_float(Decimal(row["cycle_profit_amount"])) if row["cycle_profit_amount"] is not None else None
+            ),
+            "hit_reverse_mode": bool(row["hit_reverse_mode"]),
+        }
+        for row in rows
+    ]
+
+
+def get_dry_run_pending_orders(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """아직 체결 판정 전인(=다음 프리장에서 실제 종가로 대조될) 모의 주문 목록.
+
+    실제 `submitted_orders`와 달리 하루 이상 쌓여 있을 수 있습니다(예: 노트북이 며칠
+    꺼져 있어 프리장이 며칠째 못 돈 경우) — 그래서 submitted_date도 함께 보여줍니다.
+    """
+    rows = conn.execute("SELECT * FROM dry_run_orders ORDER BY submitted_date, side, purpose").fetchall()
+    return [
+        {
+            "submitted_date": row["submitted_date"],
+            "side": row["side"],
+            "order_kind": row["order_kind"],
+            "price": _to_float(Decimal(row["price"])) if row["price"] is not None else None,
+            "qty": row["qty"],
+            "purpose": row["purpose"],
+            "is_decoy": bool(row["is_decoy"]),
+        }
+        for row in rows
+    ]
+
+
+def build_dashboard_payload(conn: sqlite3.Connection, *, today: date, dry_run_enabled: bool = False) -> dict[str, Any]:
     """대시보드 프런트엔드가 한 번의 요청으로 받아가는 전체 JSON 페이로드를 조립합니다.
 
     server.py의 `/api/dashboard` 라우트가 이 함수 하나만 호출합니다 — 라우트 코드에는
     쿼리 로직이 전혀 없어야 합니다(HTTP 계층과 데이터 계층 분리).
+
+    `dry_run_enabled`(=config.dry_run)가 True일 때만 "dry_run" 섹션을 채웁니다 —
+    실투자로 전환한 뒤에도 예전 dry_run_* 테이블 데이터가 DB에 남아있을 수 있으므로,
+    테이블 존재 여부가 아니라 현재 config를 기준으로 화면 노출 여부를 결정합니다.
     """
     return {
         "portfolio": get_portfolio_summary(conn),
@@ -318,5 +441,15 @@ def build_dashboard_payload(conn: sqlite3.Connection, *, today: date) -> dict[st
         "cycle_history": get_cycle_history(conn),
         "today_orders": get_today_order_activity(conn, today=today),
         "cancelled_orders": get_recent_cancelled_orders(conn),
+        "dry_run": (
+            {
+                "status": get_dry_run_status(conn, today=today),
+                "recent_trades": get_dry_run_recent_trades(conn),
+                "cycle_history": get_dry_run_cycle_history(conn),
+                "pending_orders": get_dry_run_pending_orders(conn),
+            }
+            if dry_run_enabled
+            else None
+        ),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }

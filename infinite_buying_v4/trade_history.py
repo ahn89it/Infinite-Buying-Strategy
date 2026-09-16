@@ -80,22 +80,27 @@ def record_buy(
     order_type: str,
     t_after: Decimal,
     avg_price_after: Decimal,
+    table: str = "buy_records",
 ) -> int:
     """체결이 확인된 매수 1건을 기록합니다. 반환값은 새로 생성된 buy_records.id.
 
     호출 시점 규칙(설계도 9-3번): 이 함수는 반드시 "실제 체결 확인 콜백"에서만
     호출해야 하며, 아직 체결되지 않은 주문 제출 시점에 호출하면 안 됩니다.
+
+    `table`: 기본은 실제 `buy_records`이지만, DRY_RUN 시뮬레이션이 이 검증된 집계
+    로직을 그대로 재사용할 수 있도록 스키마가 동일한 `dry_run_buy_records`도
+    지정할 수 있습니다(dry_run_simulator.py 참고). 항상 코드 내부 상수만 들어옵니다.
     """
     if buy_qty <= 0:
         raise TradeHistoryError(f"buy_qty는 1 이상이어야 합니다 (입력값: {buy_qty}).")
     buy_amount = buy_price * Decimal(buy_qty)
     cursor = conn.execute(
-        """
-        INSERT INTO buy_records (
+        f"""
+        INSERT INTO {table} (
             cycle_id, buy_date, buy_price, buy_qty, buy_amount, order_type,
             t_after, avg_price_after, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
+        """,  # noqa: S608
         (
             cycle_id,
             buy_date.isoformat(),
@@ -121,9 +126,12 @@ def record_sell(
     order_type: str,
     avg_price_at_sell: Decimal,
     t_after: Decimal,
+    table: str = "sell_records",
 ) -> int:
     """체결이 확인된 매도 1건을 기록합니다. 수익률/수익금은 formulas.py 공식으로 계산합니다
     (설계도 9-2번: return_pct, profit_amount는 이 매도 건 자체의 avg_price_at_sell 기준).
+
+    `table` 설명은 record_buy() 참고.
     """
     if sell_qty <= 0:
         raise TradeHistoryError(f"sell_qty는 1 이상이어야 합니다 (입력값: {sell_qty}).")
@@ -132,12 +140,12 @@ def record_sell(
     profit = calc_profit_amount(sell_price, avg_price_at_sell, sell_qty)
 
     cursor = conn.execute(
-        """
-        INSERT INTO sell_records (
+        f"""
+        INSERT INTO {table} (
             cycle_id, sell_date, sell_price, sell_qty, sell_amount, order_type,
             avg_price_at_sell, return_pct, profit_amount, t_after, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
+        """,  # noqa: S608
         (
             cycle_id,
             sell_date.isoformat(),
@@ -156,61 +164,78 @@ def record_sell(
 
 
 def open_cycle_summary(
-    conn: sqlite3.Connection, *, cycle_id: int, start_date: date, hit_reverse_mode: bool = False
+    conn: sqlite3.Connection,
+    *,
+    cycle_id: int,
+    start_date: date,
+    hit_reverse_mode: bool = False,
+    table: str = "cycle_summary",
 ) -> None:
     """새 사이클이 시작될 때 cycle_summary에 "진행 중" 행을 만듭니다 (end_date=NULL).
 
     scheduler.py가 state.bootstrap_new_state()/start_new_cycle()과 짝을 맞춰 호출해야 합니다.
+    `table` 설명은 record_buy() 참고.
     """
     conn.execute(
-        """
-        INSERT INTO cycle_summary (
+        f"""
+        INSERT INTO {table} (
             cycle_id, start_date, end_date, total_buy_amount, total_sell_amount,
             cycle_profit_amount, cycle_return_pct, hit_reverse_mode, duration_days
         ) VALUES (?, ?, NULL, '0', '0', NULL, NULL, ?, NULL)
-        """,
+        """,  # noqa: S608
         (cycle_id, start_date.isoformat(), int(hit_reverse_mode)),
     )
 
 
-def mark_cycle_hit_reverse_mode(conn: sqlite3.Connection, *, cycle_id: int) -> None:
+def mark_cycle_hit_reverse_mode(conn: sqlite3.Connection, *, cycle_id: int, table: str = "cycle_summary") -> None:
     """진행 중인 사이클이 리버스모드를 경유했음을 표시합니다 (설계도 9-2번 hit_reverse_mode)."""
     conn.execute(
-        "UPDATE cycle_summary SET hit_reverse_mode = 1 WHERE cycle_id = ?",
+        f"UPDATE {table} SET hit_reverse_mode = 1 WHERE cycle_id = ?",  # noqa: S608
         (cycle_id,),
     )
 
 
-def close_cycle_summary(conn: sqlite3.Connection, *, cycle_id: int, end_date: date) -> None:
+def close_cycle_summary(
+    conn: sqlite3.Connection,
+    *,
+    cycle_id: int,
+    end_date: date,
+    buy_table: str = "buy_records",
+    sell_table: str = "sell_records",
+    cycle_table: str = "cycle_summary",
+) -> None:
     """사이클 종료(보유수량 0) 시점에 buy_records/sell_records를 집계해 cycle_summary를 확정합니다
     (설계도 9-2, 9-3번: "건별 수익률과 사이클 전체 수익률이 다를 수 있음"에 따라 여기서 별도로
     한 번 더 집계).
+
+    `buy_table`/`sell_table`/`cycle_table`: DRY_RUN 시뮬레이션이 `dry_run_*` 테이블
+    조합으로 이 함수를 그대로 재사용할 수 있게 한 매개변수입니다(record_buy() 참고).
     """
     row = conn.execute(
-        "SELECT start_date FROM cycle_summary WHERE cycle_id = ?", (cycle_id,)
+        f"SELECT start_date FROM {cycle_table} WHERE cycle_id = ?", (cycle_id,)  # noqa: S608
     ).fetchone()
     if row is None:
         raise TradeHistoryError(
-            f"cycle_id={cycle_id}에 대한 cycle_summary 행이 없습니다. open_cycle_summary()를 "
+            f"cycle_id={cycle_id}에 대한 {cycle_table} 행이 없습니다. open_cycle_summary()를 "
             f"먼저 호출했는지 확인하세요."
         )
     start_date = date.fromisoformat(row["start_date"])
 
     # SQLite의 SUM()은 값을 float로 취급해 Decimal 정밀도가 깨지므로, 파이썬에서 직접 합산합니다.
-    total_buy = _sum_decimal_column(conn, "buy_records", "buy_amount", cycle_id)
-    total_sell = _sum_decimal_column(conn, "sell_records", "sell_amount", cycle_id)
+    total_buy = _sum_decimal_column(conn, buy_table, "buy_amount", cycle_id)
+    total_sell = _sum_decimal_column(conn, sell_table, "sell_amount", cycle_id)
 
     profit = total_sell - total_buy
     return_pct = (profit / total_buy * Decimal(100)) if total_buy > 0 else Decimal(0)
     duration_days = (end_date - start_date).days
 
     conn.execute(
-        """
-        UPDATE cycle_summary
+        f"""
+        UPDATE {cycle_table}
         SET end_date = ?, total_buy_amount = ?, total_sell_amount = ?,
             cycle_profit_amount = ?, cycle_return_pct = ?, duration_days = ?
         WHERE cycle_id = ?
-        """,
+        """,  # noqa: S608
         (
             end_date.isoformat(),
             str(total_buy),

@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
-from infinite_buying_v4 import db, scheduler
+from infinite_buying_v4 import db, dry_run_simulator, scheduler
 from infinite_buying_v4.config import Config
 from infinite_buying_v4.event_log import (
     EVENT_FULL_BUY,
@@ -27,7 +27,7 @@ from infinite_buying_v4.event_log import (
     EVENT_LIMIT_SELL_THEN_LOC_BUY_FULL,
     EVENT_QUARTER_SELL,
 )
-from infinite_buying_v4.kiwoom_adapter import FillRecord, KiwoomAdapterError, SubmittedOrder
+from infinite_buying_v4.kiwoom_adapter import DailyOHLC, FillRecord, KiwoomAdapterError, SubmittedOrder
 from infinite_buying_v4.notifier import NotifierBase, NotifyLevel
 from infinite_buying_v4.orders import OrderIntent
 from infinite_buying_v4.trade_history import (
@@ -253,6 +253,24 @@ def test_classify_full_buy_when_both_half_orders_fully_fill(conn) -> None:
     assert events == [EVENT_FULL_BUY]
 
 
+def test_classify_full_buy_when_fill_price_differs_from_submitted_price(conn) -> None:
+    """실제 재현된 버그: LOC 주문은 지정가가 아니라 그날 종가에 체결되므로, 지정가(제출가)와
+    체결가가 다른 게 정상입니다. 예전에는 금액(price*qty) 기준으로 체결 비율을 계산해서,
+    수량 전체(qty=10/10)가 체결됐어도 지정가(49.00)와 체결가(48.50)가 달라 금액 비율이
+    99% 밑으로 떨어져 FULL_BUY이어야 할 체결이 HALF_BUY로 잘못 분류됐습니다(DRY_RUN
+    시뮬레이터를 만들다가 실제 숫자로 재현되어 발견). 지금은 수량 기준으로 비교하므로
+    가격이 달라도 정확히 FULL_BUY로 분류돼야 합니다."""
+    _seed_submitted_order(conn, "O1", side="BUY", order_kind="LOC", price="49.00", qty=10, purpose=BUY_TYPE_FIRST)
+    fills = [
+        FillRecord(order_no="O1", side="BUY", fill_price=Decimal("48.50"), fill_qty=10, fill_time="", order_status=""),
+    ]
+    notifier = _RecordingNotifier()
+
+    events = scheduler._classify_daily_events(conn, fills, notifier)
+
+    assert events == [EVENT_FULL_BUY]
+
+
 def test_classify_half_buy_when_only_one_of_two_orders_fills(conn) -> None:
     """두 절반매수 주문 중 하나만 체결되면(다른 하나는 미체결) HALF_BUY(T+=0.5)로 분류돼야 합니다."""
 
@@ -429,3 +447,92 @@ def test_stale_orders_do_not_pollute_next_run_fill_ratio(conn) -> None:
     events = scheduler._classify_daily_events(conn, fills, _RecordingNotifier())
 
     assert events == [EVENT_FULL_BUY]
+
+
+# ---------------------------------------------------------------------------
+# DRY_RUN 시뮬레이터 배선 (dry_run_simulator.py 연동)
+#
+# real state는 DRY_RUN 중 절대 전진하지 않으므로(실제 주문이 없어 holding_qty가
+# 영원히 0), scheduler.py는 별도의 모의 계좌(dry_run_simulator가 관리하는 shadow
+# state)를 기준으로 오늘의 주문을 계산하고, 다음 프리장 때 실제 시세로 체결
+# 여부를 판정합니다. 아래 테스트는 이 "glue" 코드가 dry_run_simulator.py의
+# 함수를 올바른 인자로 호출하고 그 결과를 dry_run_* 테이블에 정확히 반영하는지
+# 검증합니다(전략 계산 자체의 정확성은 test_dry_run_simulator.py가 이미 담당).
+# ---------------------------------------------------------------------------
+
+
+def test_run_dry_run_regular_session_orders_bootstraps_shadow_state_and_records_first_buy(
+    conn, config: Config
+) -> None:
+    """모의 계좌가 아직 없으면 자동으로 부트스트랩되고(사람이 별도 스크립트를 실행할
+    필요 없음 - real state.bootstrap.py와의 차이점), holding_qty=0이므로 첫매수
+    미끼+사다리 주문이 dry_run_orders에 기록돼야 합니다."""
+    from infinite_buying_v4.kiwoom_adapter import Quote
+
+    today = date(2026, 9, 16)
+    fake_quote = Quote(current_price=Decimal("50.00"), prev_close=Decimal("50.00"))
+
+    with patch("infinite_buying_v4.scheduler.get_quote", return_value=fake_quote) as mock_quote:
+        scheduler._run_dry_run_regular_session_orders(config, conn, today)
+
+    mock_quote.assert_called_once()
+    rows = conn.execute("SELECT * FROM dry_run_orders WHERE submitted_date = ?", (today.isoformat(),)).fetchall()
+    assert len(rows) > 0
+    assert all(row["side"] == "BUY" for row in rows)
+
+    shadow_state = dry_run_simulator.load_dry_run_state(conn)
+    assert shadow_state.holding_qty == 0  # 아직 체결 판정 전(다음 프리장에서 처리)이므로 그대로
+
+
+def test_run_dry_run_regular_session_orders_is_isolated_from_real_submitted_orders(conn, config: Config) -> None:
+    """모의 주문은 반드시 dry_run_orders에만 쌓이고, 실제 submitted_orders 테이블은
+    절대 건드리면 안 됩니다(실제 체결 대조 로직과 뒤섞이면 안 되므로)."""
+    from infinite_buying_v4.kiwoom_adapter import Quote
+
+    today = date(2026, 9, 16)
+    fake_quote = Quote(current_price=Decimal("50.00"), prev_close=Decimal("50.00"))
+
+    with patch("infinite_buying_v4.scheduler.get_quote", return_value=fake_quote):
+        scheduler._run_dry_run_regular_session_orders(config, conn, today)
+
+    assert conn.execute("SELECT COUNT(*) AS c FROM submitted_orders").fetchone()["c"] == 0
+
+
+def test_run_dry_run_premarket_simulation_settles_prior_orders_and_advances_shadow_state(
+    conn, tmp_path: Path
+) -> None:
+    """전일 dry_run_orders를 실제(가짜로 만든) 종가로 체결 판정해 모의 계좌를 진행시키는
+    전체 경로(scheduler._run_dry_run_premarket_simulation -> dry_run_simulator.run_dry_run_premarket)를
+    검증합니다. 이 시나리오는 어제 낸 첫매수 LOC 주문(지정가 50.00)이 오늘 종가 49.00에
+    전량 체결되는 경우입니다(LOC는 지정가가 아니라 종가에 체결 - simulate_order_fill 규칙).
+
+    반드시 dry_run=True인 Config를 써야 합니다 — 아래에서 holding_qty가 0보다 커지면
+    scheduler는 오늘의 모의 지정가매도 주문도 함께 제출을 시도하는데(_submit_or_dry_run
+    경유), dry_run=False였다면 이 시뮬레이션 경로에서조차 실제 키움 API를 호출해버립니다.
+    """
+    dry_config = _make_config(dry_run=True, db_path=tmp_path / "d.db", event_log_path=tmp_path / "e.jsonl")
+    yesterday = date(2026, 9, 15)
+    today = date(2026, 9, 16)
+
+    # 어제 이미 모의 계좌가 생성돼 있고(전날 본장 실행에서), 첫매수 LOC 주문 1건을 냈다고 가정합니다.
+    dry_run_simulator.ensure_dry_run_state(conn, dry_config, start_date=yesterday)
+    order = OrderIntent(side="BUY", order_kind="LOC", price=Decimal("50.00"), qty=10, purpose=BUY_TYPE_FIRST)
+    dry_run_simulator.record_dry_run_order(conn, order, yesterday)
+
+    fake_ohlc = [
+        DailyOHLC(trade_date=yesterday, open=Decimal("49.50"), high=Decimal("50.50"), low=Decimal("48.50"), close=Decimal("49.00"))
+    ]
+    notifier = _RecordingNotifier()
+
+    with patch("infinite_buying_v4.dry_run_simulator.get_recent_daily_ohlc", return_value=fake_ohlc), patch(
+        "infinite_buying_v4.scheduler.can_place_limit_sell_order", return_value=False
+    ):
+        scheduler._run_dry_run_premarket_simulation(dry_config, conn, today, notifier)
+
+    new_shadow_state = dry_run_simulator.load_dry_run_state(conn)
+    assert new_shadow_state.holding_qty == 10
+    assert new_shadow_state.t == Decimal("1")  # 전량 체결 -> FULL_BUY -> T: 0 -> 1
+    # 어제 주문(order_no 없이 id로 관리)은 정산 후 dry_run_orders에서 제거되어야
+    # 다음 프리장에서 중복 정산되지 않습니다. 오늘 지정가매도는 위에서 시간대 가드를
+    # False로 막아뒀으므로 새로 추가되지 않아, 결국 테이블은 완전히 비어야 합니다.
+    assert conn.execute("SELECT COUNT(*) AS c FROM dry_run_orders").fetchone()["c"] == 0

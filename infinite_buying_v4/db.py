@@ -163,10 +163,108 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         PRIMARY KEY (run_type, run_date)
     )
     """,
+    # =========================================================================
+    # DRY_RUN 시뮬레이션(dry_run_simulator.py) 전용 테이블 (2026-09-16 추가)
+    # =========================================================================
+    # 실제 계좌 상태(state, buy_records, ...)는 DRY_RUN 중에는 전혀 갱신되지
+    # 않습니다(실제 체결이 없으므로). 하지만 그 상태로는 "이 전략이 정말 동작하는지"를
+    # T=0(첫매수) 이상으로는 검증할 수 없습니다. 그래서 실제 계좌와 완전히 분리된
+    # "모의 상태(shadow state)"를 두고, 실제 종가/고가/저가 데이터로 그날 주문이
+    # 체결됐을지를 시뮬레이션해서 이 모의 상태를 실제처럼 하루하루 진행시킵니다.
+    # 스키마는 실제 테이블과 최대한 동일하게 맞춰서 state.py/trade_history.py의
+    # 검증된 로직을 그대로 재사용합니다(별도 시뮬레이션 전용 로직을 새로 만들지 않음).
+
+    # dry_run_state: state와 완전히 동일한 스키마의 "모의 계좌" 상태.
+    """
+    CREATE TABLE IF NOT EXISTS dry_run_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        mode TEXT NOT NULL,
+        phase TEXT,
+        split_count INTEGER NOT NULL,
+        principal TEXT NOT NULL,
+        remaining_cash TEXT NOT NULL,
+        t_value TEXT NOT NULL,
+        avg_price TEXT NOT NULL,
+        holding_qty INTEGER NOT NULL,
+        cycle_id INTEGER NOT NULL,
+        cycle_start_date TEXT NOT NULL,
+        reverse_day_count INTEGER NOT NULL DEFAULT 0,
+        reverse_prev_qty INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    # dry_run_orders: submitted_orders의 모의 버전. 실제 주문번호가 없으므로(진짜로
+    # 제출된 적이 없음) order_no 대신 자동증가 id를 씁니다. 다음날 프리장 시점에 그날의
+    # 실제 OHLC와 대조해 체결 여부를 시뮬레이션한 뒤 삭제됩니다(체결 -> dry_run_fills로
+    # 이관, 미체결 -> 그냥 삭제, submitted_orders와 달리 "취소 이력"은 남기지 않음 —
+    # 어차피 진짜 주문이 아니었으므로 사람이 확인할 실익이 적음).
+    """
+    CREATE TABLE IF NOT EXISTS dry_run_orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        submitted_date TEXT NOT NULL,
+        side TEXT NOT NULL,
+        order_kind TEXT NOT NULL,
+        price TEXT,
+        qty INTEGER NOT NULL,
+        purpose TEXT NOT NULL,
+        is_decoy INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    # dry_run_buy_records / dry_run_sell_records: 시뮬레이션 결과 "체결됐다"고 판정된
+    # 모의 매수/매도 기록입니다. buy_records/sell_records와 스키마를 완전히 동일하게
+    # 맞춰서, trade_history.py의 record_buy()/record_sell()/close_cycle_summary()를
+    # table 매개변수만 바꿔 그대로 재사용합니다(계산 로직 중복 없음).
+    """
+    CREATE TABLE IF NOT EXISTS dry_run_buy_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cycle_id INTEGER NOT NULL,
+        buy_date TEXT NOT NULL,
+        buy_price TEXT NOT NULL,
+        buy_qty INTEGER NOT NULL,
+        buy_amount TEXT NOT NULL,
+        order_type TEXT NOT NULL,
+        t_after TEXT NOT NULL,
+        avg_price_after TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS dry_run_sell_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cycle_id INTEGER NOT NULL,
+        sell_date TEXT NOT NULL,
+        sell_price TEXT NOT NULL,
+        sell_qty INTEGER NOT NULL,
+        sell_amount TEXT NOT NULL,
+        order_type TEXT NOT NULL,
+        avg_price_at_sell TEXT NOT NULL,
+        return_pct TEXT NOT NULL,
+        profit_amount TEXT NOT NULL,
+        t_after TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    # dry_run_cycle_summary: cycle_summary의 모의 버전. 모의 사이클이 완주(보유수량 0)될
+    # 때까지 실제로 며칠 걸리는지도 함께 보여줍니다(실제 하루=모의 하루, 빨리 감기 아님).
+    """
+    CREATE TABLE IF NOT EXISTS dry_run_cycle_summary (
+        cycle_id INTEGER PRIMARY KEY,
+        start_date TEXT NOT NULL,
+        end_date TEXT,
+        total_buy_amount TEXT NOT NULL DEFAULT '0',
+        total_sell_amount TEXT NOT NULL DEFAULT '0',
+        cycle_profit_amount TEXT,
+        cycle_return_pct TEXT,
+        hit_reverse_mode INTEGER NOT NULL DEFAULT 0,
+        duration_days INTEGER
+    )
+    """,
     # 조회 성능을 위한 인덱스. cycle_id로 거래 이력을 자주 조회하므로(대시보드 등) 추가합니다.
     "CREATE INDEX IF NOT EXISTS idx_buy_records_cycle_id ON buy_records (cycle_id)",
     "CREATE INDEX IF NOT EXISTS idx_sell_records_cycle_id ON sell_records (cycle_id)",
     "CREATE INDEX IF NOT EXISTS idx_cancelled_orders_cancelled_date ON cancelled_orders (cancelled_date)",
+    "CREATE INDEX IF NOT EXISTS idx_dry_run_buy_records_cycle_id ON dry_run_buy_records (cycle_id)",
+    "CREATE INDEX IF NOT EXISTS idx_dry_run_sell_records_cycle_id ON dry_run_sell_records (cycle_id)",
 )
 
 

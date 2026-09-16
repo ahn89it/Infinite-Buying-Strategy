@@ -55,7 +55,7 @@ def create_app(config: Config | None = None) -> Flask:
         # 동시 읽기를 지원). 매번 스키마를 CREATE TABLE IF NOT EXISTS로 재확인하는 비용은
         # 개인용 대시보드의 폴링 주기(수십 초)에서는 무시할 수 있는 수준입니다.
         with db.connect(config.db_path) as conn:
-            payload = build_dashboard_payload(conn, today=now_et().date())
+            payload = build_dashboard_payload(conn, today=now_et().date(), dry_run_enabled=config.dry_run)
         return jsonify(payload)
 
     return app

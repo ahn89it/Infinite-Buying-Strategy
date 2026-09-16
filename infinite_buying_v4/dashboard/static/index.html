@@ -53,6 +53,8 @@
   }
   .badge-normal { background: rgba(62,207,142,0.15); color: var(--green); }
   .badge-reverse { background: rgba(239,91,111,0.15); color: var(--red); }
+  .badge-simulated { background: rgba(91,157,255,0.15); color: var(--blue); }
+  #dry-run-section { border: 1px dashed var(--blue); border-radius: 12px; padding: 18px 18px 6px; background: rgba(91,157,255,0.04); }
   section { margin-bottom: 28px; }
   section > h2 { font-size: 15px; margin: 0 0 12px; color: var(--text-dim); font-weight: 600; letter-spacing: 0.02em; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -107,9 +109,34 @@
   <div class="chart-wrap"><canvas id="cycle-chart"></canvas></div>
 </section>
 
+<section id="dry-run-section" hidden>
+  <h2>&#129513; DRY-RUN 모의 계좌 (실투자 전환 전 검증용)</h2>
+  <div class="note" style="margin-top:-4px;">
+    실제 계좌는 DRY_RUN 중 주문이 진짜로 체결되지 않아 T=0에 멈춰 있습니다. 아래는 실제
+    시세(일봉 시가/고가/저가/종가)로 "그 주문이 체결됐다면"을 매일 판정해 진행시킨 가상의
+    계좌 상태입니다 — 실투자 전환 전 전략이 실제로 어떻게 진행될지 미리 확인하는 용도이며,
+    실제 돈과는 무관합니다. 정규장 종가 기준 근사이므로 프리/애프터마켓 가격 변동은
+    반영하지 않습니다.
+  </div>
+  <div class="grid" id="dry-run-cards" style="margin-top:14px;"></div>
+  <div style="margin-top:18px;">
+    <div class="sub" style="margin-bottom:6px;">체결 판정 대기 중인 모의 주문</div>
+    <div id="dry-run-pending-wrap"></div>
+  </div>
+  <div style="margin-top:18px;">
+    <div class="sub" style="margin-bottom:6px;">모의 계좌 최근 거래 (최대 20건)</div>
+    <div id="dry-run-trades-wrap"></div>
+  </div>
+  <div style="margin-top:18px; margin-bottom:12px;">
+    <div class="sub" style="margin-bottom:6px;">모의 계좌 사이클별 수익률</div>
+    <div class="chart-wrap" style="height:220px;"><canvas id="dry-run-cycle-chart"></canvas></div>
+  </div>
+</section>
+
 <script>
 const REFRESH_INTERVAL_MS = 60000; // 설계도 12-1번: "최소 몇 분 간격으로 자동 갱신" -> 60초 폴링
 let chart = null;
+let dryRunChart = null;
 
 function fmtMoney(v) {
   if (v === null || v === undefined) return "-";
@@ -194,8 +221,8 @@ function renderCycle(cycle) {
   el.innerHTML = cards.join("") + (cycle.note ? `<div class="note" style="grid-column:1/-1">${cycle.note}</div>` : "");
 }
 
-function renderTrades(trades) {
-  const wrap = document.getElementById("trades-table-wrap");
+function renderTrades(trades, wrapId = "trades-table-wrap") {
+  const wrap = document.getElementById(wrapId);
   if (!trades || trades.length === 0) {
     wrap.innerHTML = `<div class="empty">거래 내역이 없습니다.</div>`;
     return;
@@ -283,22 +310,22 @@ function renderCancelledOrders(cancelledOrders) {
   </table>`;
 }
 
-function renderCycleChart(history) {
-  const canvas = document.getElementById("cycle-chart");
+function renderCycleChartInto(history, canvasId, chartRef, label) {
+  const canvas = document.getElementById(canvasId);
   if (!history || history.length === 0) {
     canvas.parentElement.innerHTML = `<div class="empty">아직 완료된 사이클이 없습니다.</div>`;
-    return;
+    return null;
   }
   const labels = history.map(h => `#${h.cycle_id}`);
   const data = history.map(h => h.cycle_return_pct);
   const colors = data.map(v => (v >= 0 ? "#3ecf8e" : "#ef5b6f"));
 
-  if (chart) chart.destroy();
-  chart = new Chart(canvas, {
+  if (chartRef) chartRef.destroy();
+  return new Chart(canvas, {
     type: "bar",
     data: {
       labels,
-      datasets: [{ label: "사이클 수익률(%)", data, backgroundColor: colors }],
+      datasets: [{ label, data, backgroundColor: colors }],
     },
     options: {
       responsive: true,
@@ -312,6 +339,65 @@ function renderCycleChart(history) {
   });
 }
 
+function renderCycleChart(history) {
+  chart = renderCycleChartInto(history, "cycle-chart", chart, "사이클 수익률(%)");
+}
+
+// --- DRY-RUN 모의 계좌(shadow state) 렌더링 -------------------------------
+// data.dry_run이 null이면(=config.dry_run이 False, 즉 실투자 모드) 섹션 자체를 숨깁니다.
+
+function renderDryRunStatus(status) {
+  const el = document.getElementById("dry-run-cards");
+  if (!status) {
+    el.innerHTML = `<div class="empty">아직 모의 계좌 시뮬레이션 데이터가 없습니다 (첫 프리장/본장 실행 대기 중).</div>`;
+    return;
+  }
+  const badge = status.mode === "REVERSE"
+    ? `<span class="badge badge-reverse">&#128308; 리버스모드(모의)</span>`
+    : `<span class="badge badge-simulated">&#128994; 일반모드(모의)${status.phase ? " · " + status.phase : ""}</span>`;
+
+  el.innerHTML = [
+    card("모드 (모의)", badge, `모의 사이클 #${status.cycle_id} · ${status.elapsed_days}일 경과 (시작 ${status.start_date})`),
+    card("T값 / 분할수 (모의)", `${fmtNum(status.t)} / ${status.split_count}`),
+    card("평단가 (모의)", fmtMoney(status.avg_price)),
+    card("보유수량 (모의)", `${status.holding_qty}주`, `잔금 ${fmtMoney(status.remaining_cash)}`),
+  ].join("");
+}
+
+function renderDryRunPendingOrders(pending) {
+  const wrap = document.getElementById("dry-run-pending-wrap");
+  if (!pending || pending.length === 0) {
+    wrap.innerHTML = `<div class="empty">체결 판정을 기다리는 모의 주문이 없습니다.</div>`;
+    return;
+  }
+  const rows = pending.map(o => `
+    <tr>
+      <td>${o.submitted_date}</td>
+      <td class="${o.side === 'BUY' ? 'side-buy' : 'side-sell'}">${o.side === 'BUY' ? '매수' : '매도'}</td>
+      <td>${purposeLabel(o.purpose)}${o.is_decoy ? ' <span class="badge" style="background:rgba(240,184,70,0.15);color:var(--amber);">미끼주문</span>' : ''}</td>
+      <td>${o.order_kind}</td>
+      <td>${o.price !== null ? fmtMoney(o.price) : '시장가'}</td>
+      <td>${o.qty}</td>
+    </tr>`).join("");
+  wrap.innerHTML = `<table>
+    <thead><tr><th>주문일</th><th>구분</th><th>유형</th><th>주문방식</th><th>주문가</th><th>수량</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+function renderDryRunSection(dryRun) {
+  const section = document.getElementById("dry-run-section");
+  if (!dryRun) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  renderDryRunStatus(dryRun.status);
+  renderDryRunPendingOrders(dryRun.pending_orders);
+  renderTrades(dryRun.recent_trades, "dry-run-trades-wrap");
+  dryRunChart = renderCycleChartInto(dryRun.cycle_history, "dry-run-cycle-chart", dryRunChart, "모의 사이클 수익률(%)");
+}
+
 async function refresh() {
   try {
     const res = await fetch("/api/dashboard");
@@ -323,6 +409,7 @@ async function refresh() {
     renderCancelledOrders(data.cancelled_orders);
     renderTrades(data.recent_trades);
     renderCycleChart(data.cycle_history);
+    renderDryRunSection(data.dry_run);
     document.getElementById("last-updated").textContent =
       `마지막 갱신: ${new Date(data.generated_at).toLocaleString("ko-KR")} (${REFRESH_INTERVAL_MS / 1000}초마다 자동 갱신)`;
   } catch (err) {

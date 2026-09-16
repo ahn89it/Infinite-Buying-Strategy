@@ -100,14 +100,21 @@ class State:
             )
 
 
-def load_state(conn: sqlite3.Connection) -> State:
+def load_state(conn: sqlite3.Connection, *, table: str = "state") -> State:
     """SQLite에서 현재 상태를 로드합니다.
 
     상태 행이 없으면(state 테이블이 비어있음) 절대 기본값을 만들지 않고
     StateError를 던집니다 — 설계도 1번의 핵심 안전장치입니다. 신규로 시작하려면
     이 함수 대신 bootstrap_new_state()를 사람이 명시적으로 호출해야 합니다.
+
+    `table` 매개변수: 기본은 실제 계좌 상태인 `state` 테이블이지만, DRY_RUN
+    시뮬레이션이 실제 계좌를 절대 건드리지 않으면서도 이 검증된 영속화 로직을
+    그대로 재사용할 수 있도록 `dry_run_state`(스키마는 동일) 같은 다른 테이블도
+    지정할 수 있게 했습니다(dry_run_simulator.py 참고). 이 값은 항상 코드 내부
+    상수(`"state"` 또는 `"dry_run_state"`)만 들어오고 사용자 입력이 절대 아니므로,
+    SQL 문자열에 직접 끼워 넣어도 인젝션 위험이 없습니다.
     """
-    row = conn.execute("SELECT * FROM state WHERE id = 1").fetchone()
+    row = conn.execute(f"SELECT * FROM {table} WHERE id = 1").fetchone()  # noqa: S608
     if row is None:
         raise StateError(
             "상태 데이터가 없습니다. 신규 시작이라면 bootstrap_new_state()를 명시적으로 "
@@ -138,17 +145,17 @@ def load_state(conn: sqlite3.Connection) -> State:
     return state
 
 
-def save_state(conn: sqlite3.Connection, state: State) -> None:
+def save_state(conn: sqlite3.Connection, state: State, *, table: str = "state") -> None:
     """현재 상태를 SQLite에 저장합니다 (id=1 행을 UPSERT).
 
     저장 직전에 반드시 validate()를 호출해, 잘못된 상태가 그대로 영속화되는
-    것을 막습니다.
+    것을 막습니다. `table` 설명은 load_state() 참고.
     """
     state.validate()
     now_iso = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        """
-        INSERT INTO state (
+        f"""
+        INSERT INTO {table} (
             id, mode, phase, split_count, principal, remaining_cash, t_value,
             avg_price, holding_qty, cycle_id, cycle_start_date,
             reverse_day_count, reverse_prev_qty, updated_at
@@ -167,7 +174,7 @@ def save_state(conn: sqlite3.Connection, state: State) -> None:
             reverse_day_count = excluded.reverse_day_count,
             reverse_prev_qty = excluded.reverse_prev_qty,
             updated_at = excluded.updated_at
-        """,
+        """,  # noqa: S608
         (
             state.mode,
             state.phase,
@@ -186,9 +193,9 @@ def save_state(conn: sqlite3.Connection, state: State) -> None:
     )
 
 
-def state_exists(conn: sqlite3.Connection) -> bool:
+def state_exists(conn: sqlite3.Connection, *, table: str = "state") -> bool:
     """상태 행이 이미 존재하는지 확인합니다. bootstrap 전에 "이미 시작됨"을 감지할 때 사용."""
-    row = conn.execute("SELECT 1 FROM state WHERE id = 1").fetchone()
+    row = conn.execute(f"SELECT 1 FROM {table} WHERE id = 1").fetchone()  # noqa: S608
     return row is not None
 
 
@@ -198,6 +205,7 @@ def bootstrap_new_state(
     split_count: int,
     principal: Decimal,
     start_date: date,
+    table: str = "state",
 ) -> State:
     """완전히 새로운 무한매수법을 시작합니다 (T=0, 보유 0, 사이클 1번).
 
@@ -205,8 +213,12 @@ def bootstrap_new_state(
     처음 시작한다"고 명시적으로 의도했을 때만(예: 최초 셋업 스크립트 1회 실행) 호출해야
     합니다. 이미 상태가 존재하면 실수로 원금/이력을 덮어쓰는 사고를 막기 위해 StateError를
     던집니다.
+
+    예외: `table="dry_run_state"`로 호출하는 DRY_RUN 시뮬레이션(dry_run_simulator.py)은
+    실제 계좌가 아니므로, 사람이 매번 수동으로 부트스트랩할 필요 없이 스케줄러가
+    필요할 때 자동으로 호출합니다(진짜 `state` 테이블에는 이 자동 호출을 절대 하지 않음).
     """
-    if state_exists(conn):
+    if state_exists(conn, table=table):
         raise StateError(
             "이미 상태가 존재합니다. 신규 시작은 상태가 전혀 없는 계좌에서만 허용됩니다. "
             "사이클을 새로 시작하려면 start_new_cycle()을 사용하세요."
@@ -230,7 +242,7 @@ def bootstrap_new_state(
         reverse_day_count=0,
         reverse_prev_qty=0,
     )
-    save_state(conn, state)
+    save_state(conn, state, table=table)
     return state
 
 
@@ -241,6 +253,7 @@ def start_new_cycle(
     fixed_principal: Decimal,
     compound_on_restart: bool,
     start_date: date,
+    table: str = "state",
 ) -> State:
     """사이클 종료(보유수량 0) 후 다음 사이클을 시작합니다 (설계도 8번).
 
@@ -273,5 +286,5 @@ def start_new_cycle(
         reverse_day_count=0,
         reverse_prev_qty=0,
     )
-    save_state(conn, new_state)
+    save_state(conn, new_state, table=table)
     return new_state

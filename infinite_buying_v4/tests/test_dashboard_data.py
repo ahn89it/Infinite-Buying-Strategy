@@ -383,6 +383,7 @@ def test_build_dashboard_payload_assembles_all_sections(conn) -> None:
         "cycle_history",
         "today_orders",
         "cancelled_orders",
+        "dry_run",
         "generated_at",
     }
     assert payload["portfolio"] is not None
@@ -391,3 +392,73 @@ def test_build_dashboard_payload_assembles_all_sections(conn) -> None:
     assert payload["cycle_history"] == []
     assert payload["today_orders"] == {"filled": [], "pending": []}
     assert payload["cancelled_orders"] == []
+    # dry_run_enabled 기본값은 False이므로, real state가 준비돼 있어도 dry_run 섹션은 비웁니다.
+    assert payload["dry_run"] is None
+
+
+def test_build_dashboard_payload_dry_run_disabled_omits_section_even_with_shadow_data(conn) -> None:
+    """실투자로 전환한 뒤에도 예전 dry_run_* 테이블에 데이터가 남아있을 수 있습니다.
+    화면 노출 여부는 테이블 존재가 아니라 dry_run_enabled(=config.dry_run) 인자로만
+    결정돼야 합니다 — 그렇지 않으면 실거래 대시보드에 낡은 시뮬레이션 데이터가
+    섞여 보이는 사고로 이어집니다."""
+    from infinite_buying_v4 import dry_run_simulator as sim
+    from infinite_buying_v4.config import Config
+
+    config = Config(
+        app_key="k", app_secret="s", api_base_url="https://x", ws_base_url="wss://x",
+        ticker="TQQQ", exchange_code="ND", split_count=40, principal=Decimal("10000"),
+        compound_on_restart=True, db_path=Path("unused.db"), event_log_path=Path("unused.jsonl"),
+        dashboard_port=8000, dry_run=True,
+    )
+    sim.ensure_dry_run_state(conn, config, start_date=date(2026, 8, 3))
+
+    payload = build_dashboard_payload(conn, today=date(2026, 8, 3), dry_run_enabled=False)
+
+    assert payload["dry_run"] is None
+
+
+def test_build_dashboard_payload_dry_run_enabled_includes_shadow_status(conn) -> None:
+    from infinite_buying_v4 import dry_run_simulator as sim
+    from infinite_buying_v4.config import Config
+
+    config = Config(
+        app_key="k", app_secret="s", api_base_url="https://x", ws_base_url="wss://x",
+        ticker="TQQQ", exchange_code="ND", split_count=40, principal=Decimal("10000"),
+        compound_on_restart=True, db_path=Path("unused.db"), event_log_path=Path("unused.jsonl"),
+        dashboard_port=8000, dry_run=True,
+    )
+    sim.ensure_dry_run_state(conn, config, start_date=date(2026, 8, 3))
+
+    payload = build_dashboard_payload(conn, today=date(2026, 8, 3), dry_run_enabled=True)
+
+    assert payload["dry_run"] is not None
+    assert set(payload["dry_run"].keys()) == {"status", "recent_trades", "cycle_history", "pending_orders"}
+    assert payload["dry_run"]["status"]["mode"] == MODE_NORMAL
+    assert payload["dry_run"]["status"]["holding_qty"] == 0
+    assert payload["dry_run"]["recent_trades"] == []
+    assert payload["dry_run"]["cycle_history"] == []
+    assert payload["dry_run"]["pending_orders"] == []
+
+
+def test_get_dry_run_status_returns_none_before_any_simulation(conn) -> None:
+    from infinite_buying_v4.dashboard.data import get_dry_run_status
+
+    assert get_dry_run_status(conn, today=date(2026, 8, 3)) is None
+
+
+def test_get_dry_run_pending_orders_reflects_dry_run_orders_table(conn) -> None:
+    from infinite_buying_v4 import dry_run_simulator as sim
+    from infinite_buying_v4.dashboard.data import get_dry_run_pending_orders
+    from infinite_buying_v4.orders import OrderIntent
+    from infinite_buying_v4.trade_history import BUY_TYPE_FIRST
+
+    order = OrderIntent(side="BUY", order_kind="LOC", price=Decimal("50.00"), qty=10, purpose=BUY_TYPE_FIRST)
+    sim.record_dry_run_order(conn, order, date(2026, 8, 3))
+
+    pending = get_dry_run_pending_orders(conn)
+
+    assert len(pending) == 1
+    assert pending[0]["side"] == "BUY"
+    assert pending[0]["price"] == 50.0
+    assert pending[0]["qty"] == 10
+    assert pending[0]["submitted_date"] == "2026-08-03"

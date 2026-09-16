@@ -34,6 +34,13 @@ normal_mode.py, reverse_mode.py, market_hours.py, kiwoom_adapter.py, notifier.py
   API 호출 없이 로그로만 남습니다. 키움 모의투자는 해외주식을 지원하지 않아 이
   프로젝트에는 모의투자 모드가 없으므로(항상 실투자 API 사용), DRY_RUN이 실거래 전
   로직을 검증하는 유일한 안전장치입니다.
+  주의: DRY_RUN 중에는 실제 주문이 없으니 실제 `state`(T, 평단, 보유수량)가 전혀
+  갱신되지 않고 T=0에 멈춰 있습니다. 그래서 dry_run_simulator.py가 실제 시세로
+  "체결됐을지"를 판정해 별도의 모의 계좌(dry_run_state 등 dry_run_* 테이블)를 진짜처럼
+  진행시킵니다 — DRY_RUN에서 실투자 전환 전 신뢰도를 최대한 끌어올리기 위한 장치입니다.
+  아래 run_premarket_update()/run_regular_session_orders()의 `if config.dry_run:` 분기가
+  이 모의 계좌 경로이고, 나머지(실제 state 기반) 경로는 dry_run 여부와 무관하게 항상
+  실행됩니다(주문 제출만 _submit_or_dry_run()에서 걸러짐).
 - 예외 정책: 이 모듈의 함수가 처리하지 않고 밖으로 던지는 예외(_run_guarded가 감쌈)는
   전부 "자동매매 중단" 대상입니다. CRITICAL 알림을 보낸 뒤 스케줄러 자체를 종료시킵니다
   (다음날 조용히 재시도하지 않음).
@@ -47,7 +54,7 @@ from dataclasses import replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
-from infinite_buying_v4 import db, event_log, normal_mode, reverse_mode, trade_history
+from infinite_buying_v4 import db, dry_run_simulator, event_log, normal_mode, reverse_mode, trade_history
 from infinite_buying_v4.config import Config, load_config
 from infinite_buying_v4.formulas import is_reverse_trigger, new_average_price
 from infinite_buying_v4.kiwoom_adapter import (
@@ -252,28 +259,36 @@ def _classify_daily_events(
     """오늘 확인된 체결들을 submitted_orders 장부와 대조해, event_log.EVENT_* 이벤트
     목록으로 변환합니다. 매칭에 사용한 submitted_orders 행은 여기서 정리(delete)합니다.
 
-    **부분체결 판정의 핵심**: "체결 비율(fill_ratio)"은 "체결된 주문들의 체결액 합"이
-    아니라 **"그 라운드에 제출된 모든 매수 주문의 의도 금액(buy_intended) 대비 실제
-    체결액(buy_filled)"**으로 계산해야 합니다. 예를 들어 전반전 절반매수(별지점+평단,
-    2건)에서 한쪽만 체결되면, 체결된 쪽만 보면 100%처럼 보이지만 전체 라운드 기준으로는
-    50%입니다. 그래서 buy_intended는 **fills에 등장했는지와 무관하게 submitted_orders에
-    남아있는 모든 매수-라운드 주문**을 기준으로 먼저 집계합니다(아래 1단계).
+    **부분체결 판정의 핵심(2026-09-16 수정)**: "체결 비율(fill_ratio)"은 **수량(주식
+    수) 기준**으로 계산합니다 — "그 라운드에 제출된 모든 매수 주문의 총 수량(buy_intended_qty)
+    대비 실제 체결 수량(buy_filled_qty)". 예를 들어 전반전 절반매수(별지점+평단, 2건)에서
+    한쪽만 체결되면, 체결된 쪽만 보면 100%처럼 보이지만 전체 라운드 기준으로는 50%입니다.
+    그래서 buy_intended_qty는 **fills에 등장했는지와 무관하게 submitted_orders에 남아있는
+    모든 매수-라운드 주문**을 기준으로 먼저 집계합니다(아래 1단계).
+
+    **금액이 아니라 수량으로 비교하는 이유**: 처음에는 금액(price*qty) 기준으로 비교했는데,
+    LOC 주문은 지정가가 아니라 **그날 종가**에 체결됩니다 — 지정가와 종가가 정확히 같을
+    일이 거의 없으므로, 주문 1건이 수량 전체가 체결됐어도 "의도 금액(지정가 기준)"과
+    "체결 금액(종가 기준)"이 달라 fill_ratio가 100%보다 조금 낮게 나와 FULL_BUY이어야 할
+    체결이 HALF_BUY로 잘못 분류되는 버그가 있었습니다(다른 노트북의 DRY_RUN 시뮬레이션
+    테스트를 만들다가 실제 숫자로 재현되어 발견됨). 수량은 가격과 무관하게 정확히
+    비교되므로 이 문제가 없습니다.
     """
     pending = _load_pending_orders(conn)
 
-    buy_intended = Decimal(0)
-    buy_filled = Decimal(0)
+    buy_intended_qty = 0
+    buy_filled_qty = 0
     quarter_sell_filled = False
     limit_sell_filled = False
 
-    # 1단계: 오늘 매칭 대상인 매수-라운드 주문의 "의도 금액" 총합을 먼저 구합니다.
+    # 1단계: 오늘 매칭 대상인 매수-라운드 주문의 "의도 수량" 총합을 먼저 구합니다.
     # 아직 체결되지 않은(=fills에 없는) 형제 주문도 반드시 포함해야 부분체결 비율이
     # 정확해집니다.
     for row in pending.values():
         if row["is_decoy"]:
             continue
         if row["purpose"] in _BUY_ROUND_PURPOSES:
-            buy_intended += Decimal(row["qty"]) * Decimal(row["price"] or "0")
+            buy_intended_qty += int(row["qty"])
 
     # 2단계: 실제 체결을 하나씩 대조합니다.
     for fill in fills:
@@ -293,7 +308,7 @@ def _classify_daily_events(
                 f"시세 급등 등 예상 밖 상황일 수 있으니 즉시 확인하세요.",
             )
         elif purpose in _BUY_ROUND_PURPOSES:
-            buy_filled += Decimal(fill.fill_qty) * fill.fill_price
+            buy_filled_qty += fill.fill_qty
         elif purpose == SELL_TYPE_QUARTER:
             quarter_sell_filled = True
         elif purpose == SELL_TYPE_LIMIT_15PCT:
@@ -306,8 +321,8 @@ def _classify_daily_events(
     if quarter_sell_filled:
         events.append(event_log.EVENT_QUARTER_SELL)
 
-    if buy_filled > 0:
-        fill_ratio = (buy_filled / buy_intended) if buy_intended > 0 else Decimal(0)
+    if buy_filled_qty > 0:
+        fill_ratio = (Decimal(buy_filled_qty) / Decimal(buy_intended_qty)) if buy_intended_qty > 0 else Decimal(0)
         is_full = fill_ratio >= _FULL_FILL_RATIO_THRESHOLD
 
         if limit_sell_filled:
@@ -343,6 +358,8 @@ def run_premarket_update(config: Config, conn: sqlite3.Connection, notifier: Not
     4) 상태 저장
     5) 보유 중이면 오늘의 지정가매도(+15%) 주문을 새로 걸기
     6) portfolio_summary 갱신
+    7) (DRY_RUN 전용) 모의 계좌(shadow state)의 전일 주문을 실제 시세로 체결 판정하고
+       진행시킨 뒤, 모의 보유 중이면 모의 지정가매도 주문도 함께 기록
     """
     today = now_et().date()
 
@@ -399,8 +416,35 @@ def run_premarket_update(config: Config, conn: sqlite3.Connection, notifier: Not
         # 다시 시도하면 되므로 WARNING으로 남깁니다.
         notifier.notify_warning("포트폴리오 요약 갱신용 시세 조회 실패", str(exc))
 
+    if config.dry_run:
+        _run_dry_run_premarket_simulation(config, conn, today, notifier)
+
     logger.info("프리장 갱신 완료: mode=%s, T=%s, holding_qty=%d", state.mode, state.t, state.holding_qty)
     return state
+
+
+def _run_dry_run_premarket_simulation(
+    config: Config, conn: sqlite3.Connection, today: date, notifier: NotifierBase
+) -> None:
+    """DRY_RUN 모의 계좌(shadow state)를 실제 시세 기준으로 진행시킵니다.
+
+    real state와 별개로 동작합니다 — 실패해도(예: OHLC 조회 실패) 실제 프리장 갱신
+    전체를 중단시키면 안 되므로, dry_run_simulator.run_dry_run_premarket() 안에서 이미
+    자체적으로 예외를 흡수하고 WARNING 로그만 남깁니다(위쪽 KiwoomAdapterError try/except
+    참고). 여기서는 추가로 다시 raise하지 않습니다.
+    """
+    dry_run_simulator.run_dry_run_premarket(conn, config, today)
+    shadow_state = dry_run_simulator.load_dry_run_state(conn)
+    if shadow_state.holding_qty > 0 and can_place_limit_sell_order():
+        for order in dry_run_simulator.generate_dry_run_sell_orders(shadow_state):
+            _submit_or_dry_run(config, order, notifier, conn, today)
+            dry_run_simulator.record_dry_run_order(conn, order, today)
+    logger.info(
+        "[DRY-RUN 시뮬레이션] 모의 계좌 프리장 갱신 완료: mode=%s, T=%s, holding_qty=%d",
+        shadow_state.mode,
+        shadow_state.t,
+        shadow_state.holding_qty,
+    )
 
 
 def _apply_fills(
@@ -565,6 +609,45 @@ def run_regular_session_orders(config: Config, conn: sqlite3.Connection, notifie
         _submit_or_dry_run(config, order, notifier, conn, today)
 
     logger.info("본장 주문 제출 완료: %d건 (dry_run=%s)", len(orders), config.dry_run)
+
+    if config.dry_run:
+        _run_dry_run_regular_session_orders(config, conn, today)
+
+
+def _run_dry_run_regular_session_orders(config: Config, conn: sqlite3.Connection, today: date) -> None:
+    """DRY_RUN 모의 계좌(shadow state) 기준으로 오늘의 LOC/MOC 주문을 계산해 dry_run_orders에
+    기록합니다. real state는 DRY_RUN 중 절대 전진하지 않으므로(주문이 실제로 체결될 일이
+    없어 holding_qty가 영원히 0), 이 함수는 위쪽에서 이미 계산한 real-state 기준 orders와는
+    별개로, dry_run_simulator가 관리하는 모의 상태를 기준으로 다시 계산합니다.
+    """
+    shadow_state = dry_run_simulator.ensure_dry_run_state(conn, config, start_date=today)
+    shadow_orders = _generate_dry_run_regular_orders(config, shadow_state)
+    for order in shadow_orders:
+        dry_run_simulator.record_dry_run_order(conn, order, today)
+        logger.info(
+            "[DRY-RUN 시뮬레이션] 모의 주문 기록: side=%s kind=%s price=%s qty=%s purpose=%s",
+            order.side,
+            order.order_kind,
+            order.price,
+            order.qty,
+            order.purpose,
+        )
+    logger.info(
+        "[DRY-RUN 시뮬레이션] 본장 모의 주문 생성 완료: %d건 (mode=%s)", len(shadow_orders), shadow_state.mode
+    )
+
+
+def _generate_dry_run_regular_orders(config: Config, state: State) -> list[OrderIntent]:
+    """_generate_normal_mode_orders/_generate_reverse_mode_orders와 동일한 구조지만,
+    real(=DRY_RUN 중 영원히 정지된) state가 아니라 dry_run_simulator의 모의 상태를
+    기준으로 주문을 생성합니다."""
+    if state.mode == MODE_NORMAL and state.holding_qty == 0:
+        quote = get_quote(config)
+        return dry_run_simulator.generate_dry_run_orders(config, state, quote.prev_close, [])
+    if state.mode == MODE_REVERSE and state.reverse_day_count > 1:
+        recent_closes = get_recent_daily_closes(config, count=5)
+        return dry_run_simulator.generate_dry_run_orders(config, state, Decimal(0), recent_closes)
+    return dry_run_simulator.generate_dry_run_orders(config, state, Decimal(0), [])
 
 
 def _generate_normal_mode_orders(config: Config, state: State) -> list[OrderIntent]:
