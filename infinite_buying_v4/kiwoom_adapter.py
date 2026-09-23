@@ -47,6 +47,7 @@ from decimal import Decimal
 from typing import Any, Awaitable, Callable, Literal
 
 from kiwoom import KiwoomError, get_client, get_ws_client
+from kiwoom.core.errors import APIError
 
 from infinite_buying_v4.config import Config
 from infinite_buying_v4.notifier import NotifierBase
@@ -118,6 +119,21 @@ class FillRecord:
 def _client():
     """OAuth 토큰 캐싱/자동 갱신을 포함한 공식 REST 클라이언트를 가져옵니다."""
     return get_client()
+
+
+# 키움 REST API는 "조회할 내역이 0건"인 정상 상황도 return_code=0(성공)이 아니라
+# 에러 코드로 응답합니다(예: 미체결 주문이 하나도 없을 때 "[2000](571758:해당
+# 계좌의 미체결내역이 없습니다.)"). 이런 응답까지 KiwoomAdapterError로 취급해
+# 예외를 던지면, "오늘 정리할 미체결 주문이 없다"는 지극히 정상적인 매일의 상황
+# 때문에 프리장 갱신 전체가 매번 실패합니다(실제로 이 문제로 여러 날 연속 프리장이
+# 한 번도 성공하지 못했던 것이 로그로 확인됨). 그래서 "내역이 없습니다" 류의
+# 메시지가 포함된 APIError는 "빈 결과"로 간주해 빈 리스트를 반환하고, 그 외의
+# 진짜 오류(인증 실패, 네트워크 오류, 계좌 권한 문제 등)만 예외로 전파합니다.
+_NO_DATA_MESSAGE_MARKERS = ("내역이 없습니다",)
+
+
+def _is_no_data_error(exc: KiwoomError) -> bool:
+    return isinstance(exc, APIError) and any(marker in exc.return_msg for marker in _NO_DATA_MESSAGE_MARKERS)
 
 
 def submit_order(config: Config, order: OrderIntent) -> SubmittedOrder:
@@ -207,6 +223,10 @@ def get_today_fills(config: Config, *, side: Literal["ALL", "BUY", "SELL"] = "AL
     scheduler.py는 장 마감 후 이 함수로 그날의 실제 체결을 받아와, trade_history.py에
     기록하고 event_log.py 재생을 위한 이벤트를 만듭니다. cntr_qty(체결수량)가 0인 행은
     아직 미체결이므로 제외합니다.
+
+    그날 체결이 하나도 없는 것도 정상 상황입니다(예: DRY_RUN이라 애초에 주문을 낸
+    적이 없는 날) — 키움 API가 이 경우를 에러 코드로 응답하더라도(_is_no_data_error
+    참고) 빈 리스트를 반환합니다.
     """
     body = {
         "slby_tp": _SLBY_TP_BY_SIDE_FILTER[side],
@@ -215,6 +235,10 @@ def get_today_fills(config: Config, *, side: Literal["ALL", "BUY", "SELL"] = "AL
     }
     try:
         response = _client().fetch_page(api_id=_TODAY_FILLS_API_ID, path=_ACCOUNT_PATH, body=body)
+    except APIError as exc:
+        if _is_no_data_error(exc):
+            return []
+        raise KiwoomAdapterError(f"당일 체결 조회 실패: {exc}") from exc
     except KiwoomError as exc:
         raise KiwoomAdapterError(f"당일 체결 조회 실패: {exc}") from exc
 
@@ -243,9 +267,16 @@ def get_open_orders(config: Config) -> list[str]:
     scheduler.py가 매일 프리장 시작 시점에 그날의 새 주문을 걸기 전, 전날 남아있는
     미체결 주문(특히 매일 새로 거는 지정가매도)을 먼저 정리하는 용도로 사용합니다.
     ord_remnq(주문잔량)가 0보다 큰 것만 "아직 살아있는 미체결 주문"으로 취급합니다.
+
+    미체결 주문이 하나도 없는 것은 매일 있을 수 있는 정상 상황입니다 — 키움 API가
+    이 경우를 에러 코드로 응답하더라도(_is_no_data_error 참고) 빈 리스트를 반환합니다.
     """
     try:
         response = _client().fetch_page(api_id=_OPEN_ORDERS_API_ID, path=_ACCOUNT_PATH, body={})
+    except APIError as exc:
+        if _is_no_data_error(exc):
+            return []
+        raise KiwoomAdapterError(f"미체결 주문 조회 실패: {exc}") from exc
     except KiwoomError as exc:
         raise KiwoomAdapterError(f"미체결 주문 조회 실패: {exc}") from exc
 
