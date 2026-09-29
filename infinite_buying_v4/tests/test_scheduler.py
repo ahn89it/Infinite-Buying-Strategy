@@ -30,6 +30,7 @@ from infinite_buying_v4.event_log import (
 from infinite_buying_v4.kiwoom_adapter import DailyOHLC, FillRecord, KiwoomAdapterError, SubmittedOrder
 from infinite_buying_v4.notifier import NotifierBase, NotifyLevel
 from infinite_buying_v4.orders import OrderIntent
+from infinite_buying_v4.state import MODE_NORMAL, PHASE_FIRST, PHASE_FIRST_HALF, State
 from infinite_buying_v4.trade_history import (
     BUY_TYPE_FIRST,
     BUY_TYPE_HALF_AVG,
@@ -536,3 +537,84 @@ def test_run_dry_run_premarket_simulation_settles_prior_orders_and_advances_shad
     # 다음 프리장에서 중복 정산되지 않습니다. 오늘 지정가매도는 위에서 시간대 가드를
     # False로 막아뒀으므로 새로 추가되지 않아, 결국 테이블은 완전히 비어야 합니다.
     assert conn.execute("SELECT COUNT(*) AS c FROM dry_run_orders").fetchone()["c"] == 0
+
+
+# ---------------------------------------------------------------------------
+# _handle_cycle_and_mode_transitions — phase 재계산 (2026-09-29 회귀 테스트)
+#
+# 실사용자 보고("미끼매수만 표시됨")를 조사하다 발견: 첫매수가 체결돼 holding_qty가
+# 0보다 커지는 바로 그 순간에도 phase 재계산 조건이 "phase != PHASE_FIRST"를
+# 요구해서, phase가 PHASE_FIRST에 영원히 멈춰있었습니다. 그 상태로 다음날
+# _generate_normal_mode_orders()가 generate_second_half_buy_orders()를 호출하면
+# T가 아직 전반전 구간이라 NormalModeError가 발생해 본장 작업이 매일 크래시할
+# 뻔했습니다(실거래 계좌가 첫매수를 체결시킨 바로 다음날부터). 아래 테스트는 이
+# 전환이 정확히 일어나는지, 그리고 그 결과로 다음 주문 생성이 실제로 크래시하지
+# 않는지를 검증합니다.
+# ---------------------------------------------------------------------------
+
+
+def _make_state(**overrides) -> State:
+    base = dict(
+        mode=MODE_NORMAL,
+        phase=PHASE_FIRST,
+        split_count=40,
+        principal=Decimal("10000"),
+        remaining_cash=Decimal("9500"),
+        t=Decimal("1"),
+        avg_price=Decimal("50.00"),
+        holding_qty=10,
+        cycle_id=1,
+        cycle_start_date=date(2026, 8, 3),
+        reverse_day_count=0,
+        reverse_prev_qty=0,
+    )
+    base.update(overrides)
+    return State(**base)
+
+
+def test_handle_cycle_and_mode_transitions_advances_phase_out_of_first_once_holding(
+    conn, config: Config
+) -> None:
+    """첫매수가 막 체결돼 holding_qty>0, T=1(전반전 구간)이 된 상태를 넣으면, phase가
+    PHASE_FIRST에 머물지 않고 PHASE_FIRST_HALF로 전환돼야 합니다."""
+    state = _make_state(phase=PHASE_FIRST, holding_qty=10, t=Decimal("1"))
+    notifier = _RecordingNotifier()
+
+    new_state = scheduler._handle_cycle_and_mode_transitions(conn, config, state, date(2026, 8, 4), notifier)
+
+    assert new_state.phase == PHASE_FIRST_HALF
+
+
+def test_warn_if_only_decoy_survived_logs_warning_for_decoy_only_orders(caplog) -> None:
+    decoy = OrderIntent(side="BUY", order_kind="LOC", price=Decimal("100.00"), qty=1, purpose=BUY_TYPE_FIRST, is_decoy=True)
+
+    with caplog.at_level("WARNING", logger="infinite_buying_v4.scheduler"):
+        scheduler._warn_if_only_decoy_survived([decoy])
+
+    assert any("미끼(decoy) 1건만 남았습니다" in record.message for record in caplog.records)
+
+
+def test_warn_if_only_decoy_survived_silent_when_real_orders_exist(caplog) -> None:
+    decoy = OrderIntent(side="BUY", order_kind="LOC", price=Decimal("100.00"), qty=1, purpose=BUY_TYPE_FIRST, is_decoy=True)
+    ladder = OrderIntent(side="BUY", order_kind="LOC", price=Decimal("85.00"), qty=1, purpose=BUY_TYPE_FIRST, is_decoy=False)
+
+    with caplog.at_level("WARNING", logger="infinite_buying_v4.scheduler"):
+        scheduler._warn_if_only_decoy_survived([decoy, ladder])
+
+    assert not any("미끼(decoy)" in record.message for record in caplog.records)
+
+
+def test_generate_normal_mode_orders_does_not_crash_the_day_after_first_buy_fills(
+    conn, config: Config
+) -> None:
+    """위 전환이 없다면 이 테스트가 NormalModeError로 실패합니다 — phase가 여전히
+    PHASE_FIRST(≠PHASE_FIRST_HALF)이면 _generate_normal_mode_orders()가
+    generate_second_half_buy_orders()를 호출하는데, T=1은 아직 전반전 구간이라
+    그 함수가 바로 예외를 던지기 때문입니다."""
+    state = _make_state(phase=PHASE_FIRST, holding_qty=10, t=Decimal("1"))
+    notifier = _RecordingNotifier()
+
+    advanced_state = scheduler._handle_cycle_and_mode_transitions(conn, config, state, date(2026, 8, 4), notifier)
+    orders = scheduler._generate_normal_mode_orders(config, advanced_state)
+
+    assert all(o.purpose in (BUY_TYPE_HALF_STAR, BUY_TYPE_HALF_AVG) for o in orders)

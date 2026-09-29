@@ -305,21 +305,41 @@ def _refresh_dry_run_portfolio_summary(conn: sqlite3.Connection, config: Config,
 
 def _settle_day(conn: sqlite3.Connection, config: Config, state: State, target_date: date, ohlc: DailyOHLC) -> State:
     """하루치 dry_run_orders를 정산합니다: 체결 판정 -> 모의 buy/sell 기록 -> T/평단/
-    보유수량/잔금 갱신 -> 사이클 종료/리버스모드 전이 -> dry_run_orders 정리."""
+    보유수량/잔금 갱신 -> 사이클 종료/리버스모드 전이 -> dry_run_orders 정리.
+
+    미끼(decoy) 주문은 체결 판정에서 제외합니다(2026-09-29 수정). 미끼는 전일종가+12%라는
+    고의로 시세와 동떨어진 가격에 걸어 증권사의 주문가 제한을 우회하는 용도라(설계도
+    5-1번), 실제로는 증권사 쪽 가격 제한 검증에 걸려 거의 체결되지 않습니다 — 그런데
+    simulate_order_fill()의 LOC 판정 규칙(종가<=지정가)만으로는 "전일 대비 +12% 이상
+    오르지 않은 지극히 평범한 날"조차 전부 "체결됨"으로 잘못 판정합니다(증권사의 주문가
+    제한 검증 자체를 시뮬레이션할 방법이 없기 때문). 그 결과를 그대로 모의 계좌에
+    반영하면, 실제로는 일어나지 않을 미끼 체결이 거의 매일 발생한 것처럼 잘못된 평단가/
+    보유수량이 쌓이고, 정작 의도한 진짜 매수(사다리 주문)는 반영되지 않는 문제가
+    있었습니다(실사용자 보고로 발견: "미끼매수만 표시됨"). 미끼가 이 규칙을 만족하는
+    경우는 "체결됐다면 이상 상황"이라는 취지에 맞게 WARNING만 남기고, 모의 계좌 상태에는
+    반영하지 않습니다.
+    """
     orders = _load_orders_for_date(conn, target_date)
     if not orders:
         return state
 
-    fills = [f for o in orders if (f := simulate_order_fill(o, ohlc)) is not None]
-
-    for fill in fills:
-        if fill.order.is_decoy:
+    fills: list[SimulatedFill] = []
+    for order in orders:
+        fill = simulate_order_fill(order, ohlc)
+        if fill is None:
+            continue
+        if order.is_decoy:
             logger.warning(
-                "[DRY-RUN 시뮬레이션] 미끼 주문이 시뮬레이션상 체결됐을 것으로 판정됨(day=%s, price=%s) — "
-                "실제였다면 이상 상황이니 눈여겨보세요.",
+                "[DRY-RUN 시뮬레이션] 미끼 주문이 단순 종가 기준 규칙(LOC: 종가<=지정가)으로는 "
+                "'체결됐을 것'으로 판정됐지만, 실제로는 증권사 주문가 제한(전일종가+12%%)에 걸려 "
+                "거의 체결되지 않으므로 모의 계좌에는 반영하지 않습니다(day=%s, price=%s).",
                 target_date.isoformat(),
                 fill.fill_price,
             )
+            continue
+        fills.append(fill)
+
+    for fill in fills:
         if fill.order.side == "BUY":
             state = replace(
                 state,
@@ -399,7 +419,15 @@ def _settle_day(conn: sqlite3.Connection, config: Config, state: State, target_d
             logger.info("[DRY-RUN 시뮬레이션] 모의 계좌 일반모드 복귀")
         else:
             state = replace(state, reverse_day_count=state.reverse_day_count + 1, reverse_prev_qty=state.holding_qty)
-    elif state.mode == MODE_NORMAL and state.holding_qty > 0 and state.phase != PHASE_FIRST:
+    elif state.mode == MODE_NORMAL and state.holding_qty > 0:
+        # 2026-09-29 수정: 예전에는 `and state.phase != PHASE_FIRST` 조건이 더 있어서,
+        # 첫매수가 막 체결돼 phase를 FIRST_HALF로 전환해야 하는 바로 그 순간에 조건이
+        # 막혀 phase가 PHASE_FIRST에 영원히 멈춰있었습니다(scheduler.py의 동일 로직도
+        # 같은 이유로 함께 수정 — 자세한 내용은 그쪽 주석 참고). 그 상태로 다음날
+        # `generate_dry_run_orders()`가 `generate_second_half_buy_orders()`를 호출하면
+        # T가 아직 전반전 구간이라 `NormalModeError`가 발생해 본장 시뮬레이션이 매번
+        # 크래시했습니다 — 실사용자가 "미끼매수만 표시된다"고 보고한 원인을 조사하다
+        # 실제 숫자로 재현되어 발견됨.
         from infinite_buying_v4.formulas import is_first_half
 
         new_phase = PHASE_FIRST_HALF if is_first_half(state.t, state.split_count) else PHASE_SECOND_HALF

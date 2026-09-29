@@ -549,12 +549,27 @@ def _handle_cycle_and_mode_transitions(
             return replace(state, mode=MODE_NORMAL, phase=PHASE_SECOND_HALF)
         return replace(state, reverse_day_count=state.reverse_day_count + 1, reverse_prev_qty=state.holding_qty)
 
-    # 일반모드 phase 재계산 (전반전<->후반전 경계를 매일 다시 확인)
+    # 일반모드 phase 재계산 (전반전<->후반전 경계를 매일 다시 확인).
+    #
+    # 2026-09-29 수정: 예전에는 `and state.phase != PHASE_FIRST` 조건이 더 있어서,
+    # phase가 PHASE_FIRST인 동안에는 이 블록이 아예 아무것도 하지 않았습니다. 그런데
+    # PHASE_FIRST는 "아직 첫매수도 안 됨(holding_qty==0)"을 뜻하는 값인데, 이 블록은
+    # 이미 `holding_qty > 0`을 전제로 들어옵니다 — 즉 "첫매수가 막 체결돼서 phase를
+    # FIRST_HALF로 전환해야 하는 바로 그 순간"에 정확히 조건이 막혀서, phase가
+    # PHASE_FIRST에 영원히 멈춰있게 됐습니다. 이후 `_generate_normal_mode_orders()`는
+    # `phase == PHASE_FIRST_HALF`가 아니면 무조건 `generate_second_half_buy_orders()`를
+    # 호출하는데, 그 함수는 T가 전반전 구간(T <= 분할수/2)이면 `NormalModeError`를
+    # 던지도록 되어 있어 — 첫매수 다음 날(T=1)부터 본장 작업이 매번 크래시했을
+    # 뻔했습니다(DRY_RUN 모의 계좌 시뮬레이션에서 실제 숫자로 재현되어 발견 — 첫매수가
+    # 체결되자마자 다음날 정산에서 이 예외가 발생함). 대시보드의 "다음 매수/매도
+    # 목표가"도 phase==PHASE_FIRST를 "아직 첫매수 전"으로 해석해 계속 공란으로
+    # 표시되는 부작용도 있었습니다. 지금은 phase가 PHASE_FIRST여도 재계산 대상에
+    # 포함시켜, 첫매수 체결 즉시 FIRST_HALF로 정확히 전환됩니다.
     if state.mode == MODE_NORMAL and state.holding_qty > 0:
         from infinite_buying_v4.formulas import is_first_half
 
         new_phase = PHASE_FIRST_HALF if is_first_half(state.t, state.split_count) else PHASE_SECOND_HALF
-        if new_phase != state.phase and state.phase != PHASE_FIRST:
+        if new_phase != state.phase:
             return replace(state, phase=new_phase)
 
     return state
@@ -609,9 +624,30 @@ def run_regular_session_orders(config: Config, conn: sqlite3.Connection, notifie
         _submit_or_dry_run(config, order, notifier, conn, today)
 
     logger.info("본장 주문 제출 완료: %d건 (dry_run=%s)", len(orders), config.dry_run)
+    _warn_if_only_decoy_survived(orders)
 
     if config.dry_run:
         _run_dry_run_regular_session_orders(config, conn, today)
+
+
+def _warn_if_only_decoy_survived(orders: list[OrderIntent]) -> None:
+    """첫매수 주문 생성 결과가 미끼(decoy) 1건뿐이면(실체결 노림 사다리 주문이 전부
+    수량 0으로 걸러짐) 원인을 바로 알 수 있도록 WARNING을 남깁니다.
+
+    `normal_mode.generate_first_buy_orders()`는 1회매수금(PRINCIPAL/분할수)을
+    사다리 단계 수만큼 더 잘게 나눈 뒤, 그 금액으로 1주도 못 사는 가격대는 조용히
+    건너뜁니다(가격 정보가 없는 순수 계산 함수라 로그를 남기지 않음). PRINCIPAL이
+    너무 작으면(예: DRY_RUN 테스트용으로 실제 운용 규모보다 훨씬 작게 잡은 경우)
+    사다리 주문이 전부 걸러지고 미끼만 남아, "미끼매수만 계속 표시된다"는 증상으로
+    이어집니다(실사용자 보고로 발견). 이 경우 사용자가 로그만 보고도 원인(예산 부족)을
+    바로 알 수 있도록 여기서 경고합니다.
+    """
+    if len(orders) == 1 and orders[0].is_decoy:
+        logger.warning(
+            "첫매수 사다리 주문이 전부 생략되고 미끼(decoy) 1건만 남았습니다 — PRINCIPAL이 "
+            "너무 작아 1회매수금을 사다리 단계 수로 나눈 예산으로 1주도 살 수 없는 것으로 "
+            "보입니다. .env의 PRINCIPAL 값을 늘리거나 split_count를 조정하세요."
+        )
 
 
 def _run_dry_run_regular_session_orders(config: Config, conn: sqlite3.Connection, today: date) -> None:
@@ -635,6 +671,7 @@ def _run_dry_run_regular_session_orders(config: Config, conn: sqlite3.Connection
     logger.info(
         "[DRY-RUN 시뮬레이션] 본장 모의 주문 생성 완료: %d건 (mode=%s)", len(shadow_orders), shadow_state.mode
     )
+    _warn_if_only_decoy_survived(shadow_orders)
 
 
 def _generate_dry_run_regular_orders(config: Config, state: State) -> list[OrderIntent]:

@@ -223,6 +223,41 @@ def test_settle_day_full_fill_updates_state_and_records_buy(conn, config: Config
     assert sim._load_orders_for_date(conn, date(2026, 8, 3)) == []
 
 
+def test_settle_day_decoy_fill_is_ignored_and_does_not_mutate_state(conn, config: Config) -> None:
+    """실사용자 보고로 발견된 버그의 회귀 테스트: 미끼(decoy) 주문은 전일종가+12%라는
+    고의로 시세와 동떨어진 가격에 걸리므로, 실제로는 증권사 주문가 제한에 걸려 거의
+    체결되지 않습니다. 그런데 단순 종가 기준 LOC 판정 규칙(종가<=지정가)만으로는
+    "전일 대비 12% 넘게 오르지 않은 평범한 날"조차 전부 "체결됨"으로 오판합니다.
+    이 시나리오는 그런 평범한 날(전일종가 대비 소폭 하락)에도 미끼가 규칙상으로는
+    만족되지만, 모의 계좌 상태(T/평단가/보유수량/잔금)에는 절대 반영되면 안 됨을
+    검증합니다 — 반영되면 실제로는 거의 일어나지 않는 미끼 체결이 매일 발생한 것처럼
+    잘못된 평단가가 쌓이고, 정작 의도한 진짜 매수(사다리 주문)는 생성조차 되지 않는
+    (예: 원금이 작아 사다리 주문 수량이 전부 0으로 필터링되는) 경우 대시보드에
+    "미끼매수만 표시"되는 증상으로 이어집니다.
+    """
+    sim.ensure_dry_run_state(conn, config, start_date=date(2026, 8, 3))
+    state = load_state(conn, table="dry_run_state")
+
+    # 미끼 주문만 하나 존재하는 상황(원금이 작아 사다리 주문이 전부 0주로 필터링된 경우와 동일).
+    conn.execute(
+        "INSERT INTO dry_run_orders (submitted_date, side, order_kind, price, qty, purpose, is_decoy) VALUES (?,?,?,?,?,?,?)",
+        ("2026-08-03", "BUY", "LOC", "56.00", 1, BUY_TYPE_FIRST, 1),
+    )
+    # 전일종가(50.00) 대비 소폭 하락한 지극히 평범한 날. 종가(49.50) <= 미끼가(56.00)이므로
+    # 단순 규칙상으로는 "체결"이지만, 실제로는 이 정도로 미끼가 체결될 일이 없습니다.
+    ohlc = _ohlc(date(2026, 8, 3), o="50.00", h="50.50", l="49.00", c="49.50")
+
+    new_state = sim._settle_day(conn, config, state, date(2026, 8, 3), ohlc)
+
+    assert new_state.holding_qty == 0
+    assert new_state.avg_price == state.avg_price
+    assert new_state.remaining_cash == state.remaining_cash
+    assert new_state.t == state.t
+    assert conn.execute("SELECT COUNT(*) AS c FROM dry_run_buy_records").fetchone()["c"] == 0
+    # 정산은 끝났으니 대기 주문에서는 정리되어야 합니다.
+    assert sim._load_orders_for_date(conn, date(2026, 8, 3)) == []
+
+
 def test_settle_day_no_fill_leaves_state_unchanged(conn, config: Config) -> None:
     sim.ensure_dry_run_state(conn, config, start_date=date(2026, 8, 3))
     state = load_state(conn, table="dry_run_state")
