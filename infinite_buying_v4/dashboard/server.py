@@ -65,7 +65,9 @@ def main() -> None:
     config = load_config()
     from infinite_buying_v4.logging_setup import configure_logging
 
-    configure_logging(config)  # 콘솔 + data/logs/app.log 파일에 동시 기록
+    # component="dashboard": scheduler.py와 별도 프로세스(별도 컨테이너)이므로
+    # 반드시 다른 로그 파일을 써야 합니다 — logging_setup.py 모듈 docstring 참고.
+    configure_logging(config, component="dashboard")  # 콘솔 + data/logs/dashboard.log
     app = create_app(config)
     logger.info("대시보드 서버 시작: http://0.0.0.0:%d (Ctrl+C로 종료)", config.dashboard_port)
     app.run(host="0.0.0.0", port=config.dashboard_port)

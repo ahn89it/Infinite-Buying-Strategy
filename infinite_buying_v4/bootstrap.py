@@ -43,7 +43,9 @@ def main() -> None:
 
     from infinite_buying_v4.logging_setup import configure_logging
 
-    configure_logging(config)  # 콘솔 + data/logs/app.log 파일에 동시 기록
+    # component="bootstrap": scheduler.py/dashboard.server.py와 별도 프로세스로
+    # 실행되므로 반드시 다른 로그 파일을 써야 합니다 — logging_setup.py 모듈 docstring 참고.
+    configure_logging(config, component="bootstrap")  # 콘솔 + data/logs/bootstrap.log
 
     conn = db.get_connection(config.db_path)
     try:

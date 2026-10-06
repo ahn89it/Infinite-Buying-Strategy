@@ -825,5 +825,7 @@ if __name__ == "__main__":
     from infinite_buying_v4.logging_setup import configure_logging
 
     _config = load_config()
-    configure_logging(_config)  # 콘솔 + data/logs/app.log 파일에 동시 기록
+    # component="scheduler": dashboard/server.py와 별도 프로세스(별도 컨테이너)이므로
+    # 반드시 다른 로그 파일을 써야 합니다 — logging_setup.py 모듈 docstring 참고.
+    configure_logging(_config, component="scheduler")  # 콘솔 + data/logs/scheduler.log
     start_scheduler(_config)

@@ -57,7 +57,12 @@ def _start_dashboard_thread(config: Config) -> threading.Thread:
 
 def main() -> None:
     config = load_config()
-    configure_logging(config)
+    # component="app": 대시보드(백그라운드 스레드)와 스케줄러(메인 스레드)가 이 함수
+    # 안에서 같은 프로세스로 함께 실행되므로, 하나의 로그 파일을 공유해도 안전합니다
+    # (logging_setup.py 모듈 docstring의 "여러 프로세스가 같은 파일을 쓰면 위험하다"는
+    # 경고는 서로 다른 프로세스/컨테이너로 떠 있는 scheduler.py/dashboard/server.py에만
+    # 해당됩니다).
+    configure_logging(config, component="app")
 
     logger.info("대시보드를 백그라운드로 시작합니다: http://localhost:%d", config.dashboard_port)
     _start_dashboard_thread(config)

@@ -3,12 +3,19 @@ test_logging_setup.py
 =======================
 logging_setup.py의 로그 파일 회전 설정을 검증합니다.
 
-핵심 검증 포인트: 로그 파일이 "KST 자정" 기준으로 날짜별 회전되는지 — 이는
-TimedRotatingFileHandler를 utc=True + atTime=UTC 15:00으로 설정해 구현했습니다
-(KST는 서머타임이 없는 UTC+9 고정 오프셋이므로, UTC 15:00이 항상 정확히 KST
-00:00과 같습니다). 실제로 자정을 넘겨 파일이 회전되는 것까지 테스트하지는
-않습니다(시간 흐름 자체를 mocking해야 해서 배보다 배꼽이 커짐) — 대신 핸들러가
-올바른 파라미터로 구성됐는지만 확인합니다.
+핵심 검증 포인트 두 가지:
+1. 로그 파일이 "KST 자정" 기준으로 날짜별 회전되는지 — TimedRotatingFileHandler를
+   utc=True + atTime=UTC 15:00으로 설정해 구현했습니다(KST는 서머타임이 없는 UTC+9
+   고정 오프셋이므로, UTC 15:00이 항상 정확히 KST 00:00과 같습니다). 실제로 자정을
+   넘겨 파일이 회전되는 것까지 테스트하지는 않습니다(시간 흐름 자체를 mocking해야
+   해서 배보다 배꼽이 커짐) — 대신 핸들러가 올바른 파라미터로 구성됐는지만 확인합니다.
+2. **`component`마다 완전히 다른 파일에 기록되는지** (2026-10-06 추가) — scheduler.py와
+   dashboard/server.py가 서로 다른 프로세스(별도 컨테이너)로 같은 파일에 동시에 쓰면
+   TimedRotatingFileHandler의 회전(rename) 로직이 서로 충돌해 로그 파일이 손상됩니다
+   (실제 운영 로그에서 수만 바이트의 NUL 바이트 손상, 날짜가 뒤섞인 파일명으로 재현되어
+   발견 — "스케줄러가 조용히 멈춘 것처럼 보이는" 미스터리의 실제 원인이었음). 이 버그는
+   `configure_logging()`을 호출부마다 다른 `component` 이름으로 호출하도록 강제해서
+   원천적으로 막습니다.
 """
 
 from __future__ import annotations
@@ -58,17 +65,39 @@ def _get_file_handler() -> TimedRotatingFileHandler:
     return handlers[0]
 
 
-def test_configure_logging_creates_log_file_at_data_dir_logs(config: Config) -> None:
-    configure_logging(config)
+def test_configure_logging_creates_log_file_named_after_component(config: Config) -> None:
+    configure_logging(config, component="scheduler")
 
-    expected_path = config.db_path.parent / "logs" / "app.log"
+    expected_path = config.db_path.parent / "logs" / "scheduler.log"
     assert expected_path.exists()
+
+
+def test_configure_logging_different_components_write_to_different_files(config: Config) -> None:
+    """회귀 테스트: scheduler.py와 dashboard/server.py는 별도 프로세스(별도 컨테이너)로
+    뜨므로, 같은 파일을 공유하면 TimedRotatingFileHandler의 회전(rename) 로직이
+    충돌해 로그가 손상됩니다(실제로 NUL 바이트 손상이 재현됨). component 이름이
+    다르면 물리적으로 완전히 다른 파일 경로가 되어야 이 위험이 원천적으로 없습니다.
+    """
+    configure_logging(config, component="scheduler")
+    logging.getLogger("infinite_buying_v4.scheduler").info("스케줄러 로그")
+
+    configure_logging(config, component="dashboard")
+    logging.getLogger("infinite_buying_v4.dashboard").info("대시보드 로그")
+
+    scheduler_log = config.db_path.parent / "logs" / "scheduler.log"
+    dashboard_log = config.db_path.parent / "logs" / "dashboard.log"
+    assert scheduler_log != dashboard_log
+    assert "스케줄러 로그" in scheduler_log.read_text(encoding="utf-8")
+    assert "대시보드 로그" in dashboard_log.read_text(encoding="utf-8")
+    # 서로의 내용이 상대방 파일로 새어나가면 안 됩니다.
+    assert "대시보드 로그" not in scheduler_log.read_text(encoding="utf-8")
+    assert "스케줄러 로그" not in dashboard_log.read_text(encoding="utf-8")
 
 
 def test_configure_logging_rotates_at_kst_midnight_regardless_of_host_timezone(config: Config) -> None:
     """KST는 서머타임이 없는 UTC+9 고정 오프셋이므로, "UTC 15:00마다 회전"으로 설정하면
     호스트 시스템의 시간대 설정과 무관하게 항상 정확히 KST 00:00에 회전됩니다."""
-    configure_logging(config)
+    configure_logging(config, component="scheduler")
 
     handler = _get_file_handler()
     assert handler.utc is True
@@ -81,9 +110,9 @@ def test_configure_logging_does_not_accumulate_handlers_on_repeated_calls(config
     """__main__.py처럼 대시보드+스케줄러를 한 프로세스에서 같이 띄우는 경우,
     configure_logging()이 여러 번 불려도 핸들러가 계속 누적되면 안 됩니다
     (누적되면 로그 한 줄마다 파일에 여러 번 중복 기록됨)."""
-    configure_logging(config)
-    configure_logging(config)
-    configure_logging(config)
+    configure_logging(config, component="app")
+    configure_logging(config, component="app")
+    configure_logging(config, component="app")
 
     root = logging.getLogger()
     file_handlers = [h for h in root.handlers if isinstance(h, TimedRotatingFileHandler)]
@@ -93,7 +122,7 @@ def test_configure_logging_does_not_accumulate_handlers_on_repeated_calls(config
 
 
 def test_configure_logging_writes_log_records_to_the_file(config: Config) -> None:
-    configure_logging(config)
+    configure_logging(config, component="app")
 
     logging.getLogger("infinite_buying_v4.test").info("테스트 로그 메시지")
 
